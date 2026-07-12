@@ -1,8 +1,11 @@
 <launch>
     <let name="urdf_path"
          value="$(find-pkg-share my_robot_description)/urdf/my_robot.urdf.xacro" />
+    <!-- <let name="rviz_config_path"
+        value="$(find-pkg-share my_robot_description)/rviz/config.rviz" /> -->
+
     <let name="rviz_config_path"
-        value="$(find-pkg-share my_robot_description)/rviz/config.rviz" />
+        value="$(find-pkg-share my_robot_description)/rviz/config_camera_arm.rviz" />
 
     <node pkg="robot_state_publisher" exec="robot_state_publisher">
         <param name="robot_description"
