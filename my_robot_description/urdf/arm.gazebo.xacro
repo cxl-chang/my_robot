@@ -30,7 +30,7 @@
 
     <gazebo>
         <plugin name="gz::sim::systems::JointStatePublisher" filename="gz-sim-joint-state-publisher-system">
-            <updateRate>10.0</updateRate>
+            <update_rate>10</update_rate>
             <joint_name>joint1</joint_name>
             <joint_name>joint2</joint_name>
             <joint_name>joint3</joint_name>
