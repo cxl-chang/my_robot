@@ -232,4 +232,9 @@
         <child link="tool_link"/>
         <dynamics damping="0.05" friction="0.1"/>
     </joint>
+
+    <!-- add gripper relative to hand begin-->
+    <xacro:include filename="gripper.xacro" />
+    <!-- add gripper relative to hand end-->
+
 </robot>

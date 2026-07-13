@@ -39,4 +39,8 @@
             <joint_name>joint6</joint_name>
         </plugin>
     </gazebo>
+
+    <!-- add gripper relative to hand begin-->
+    <xacro:include filename="gripper.gazebo.xacro" />
+    <!-- add gripper relative to hand end-->
 </robot>
