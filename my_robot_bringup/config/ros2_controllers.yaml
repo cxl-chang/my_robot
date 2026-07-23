@@ -1,0 +1,50 @@
+# This config file is used by ros2_control
+controller_manager:
+  ros__parameters:
+    update_rate: 100  # Hz
+
+    arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+
+    gripper_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    diff_drive_controller:
+      type: diff_drive_controller/DiffDriveController
+
+arm_controller:
+  ros__parameters:
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+gripper_controller:
+  ros__parameters:
+    joints:
+      - gripper_left_finger_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+
+diff_drive_controller:
+  ros__parameters:
+    left_wheel_names: ["base_left_wheel_joint"]
+    right_wheel_names: ["base_right_wheel_joint"]
+
+    wheel_separation: 0.5
+    wheel_radius: 0.1
+    odom_frame_id: "odom"
+    base_frame_id: "base_footlink"
