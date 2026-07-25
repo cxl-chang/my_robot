@@ -80,7 +80,7 @@ int main(int argc, char **argv)
     target_pose.pose.position.z = 0.478;
 
     tf2::Quaternion q;
-    q.setRPY(-2.551, -0.877, -0.828); // -2.551, -0.877, -0.828
+    q.setRPY(3.14, 0, -0.828); // -2.551, -0.877, -0.828
     q = q.normalize();
     target_pose.pose.orientation.x = q.x();
     target_pose.pose.orientation.y = q.y();
@@ -101,6 +101,46 @@ int main(int argc, char **argv)
     {
         RCLCPP_ERROR(node->get_logger(), "Planning to pose goal failed.");
     }
+
+
+    //cartisian path
+    std::vector<geometry_msgs::msg::Pose> waypoints;
+    geometry_msgs::msg::Pose cartisian_pose = arm_group->getCurrentPose().pose;
+    cartisian_pose.position.z += -0.2;  // Move down
+    waypoints.push_back(cartisian_pose);
+    moveit_msgs::msg::RobotTrajectory trajectory;
+    const double jump_threshold = 0.0;
+    const double eef_step = 0.01; // 1cm
+    double fraction = arm_group->computeCartesianPath(waypoints, eef_step, jump_threshold, trajectory);
+    if (fraction > 0.0)
+    {
+        RCLCPP_INFO(node->get_logger(), "Cartesian path computation was successful. fraction: %f", fraction);
+        arm_group->execute(trajectory);
+    }
+    else
+    {
+        RCLCPP_ERROR(node->get_logger(), "Cartesian path computation failed.");
+    }
+
+    //=========================gripper goal=========================
+    auto gripper_group = std::make_shared<moveit::planning_interface::MoveGroupInterface>(node, "gripper");
+    RCLCPP_INFO(node->get_logger(), "MoveGroupInterface for 'gripper' has been created.");
+    gripper_group->setStartStateToCurrentState();
+    gripper_group->setNamedTarget("gripper_closed");
+    moveit::planning_interface::MoveGroupInterface::Plan gripper_plan;
+    bool gripper_success = (gripper_group->plan(gripper_plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    if(gripper_success)
+    {
+        RCLCPP_INFO(node->get_logger(), "Planning for 'gripper_closed' was successful.");
+        gripper_group->execute(gripper_plan);
+        RCLCPP_INFO(node->get_logger(), "Execution of the plan for 'gripper_closed' has started.");
+    }
+    else
+    {
+        RCLCPP_ERROR(node->get_logger(), "Planning for 'gripper_closed' failed.");
+    }
+
+
 
 
   rclcpp::shutdown();
