@@ -2,10 +2,12 @@
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <example_interfaces/msg/bool.hpp>
 #include <example_interfaces/msg/float64_multi_array.hpp>
+#include <my_robot_interfaces/msg/pose_command.hpp>
 
 using MoveGroupInterface = moveit::planning_interface::MoveGroupInterface;
 using Bool = example_interfaces::msg::Bool;
 using FloatArray = example_interfaces::msg::Float64MultiArray;
+using PoseCommand = my_robot_interfaces::msg::PoseCommand;
 using namespace std::placeholders;
 
 class commander
@@ -24,6 +26,10 @@ public:
 
         joint_cmd_sub_ = node_->create_subscription<FloatArray>(
             "joint_cmd", 10, std::bind(&commander::jonitCmdCallback, this, _1)
+        );
+
+        pose_cmd_sub_ = node_->create_subscription<PoseCommand>(
+            "pose_cmd", 10, std::bind(&commander::poseCmdCallback, this, _1)
         );
     }
 
@@ -123,6 +129,8 @@ private:
 
     rclcpp::Subscription<FloatArray>::SharedPtr joint_cmd_sub_;
 
+    rclcpp::Subscription<PoseCommand>::SharedPtr pose_cmd_sub_;
+
     void gripperCallback(const Bool& msg)
     {
         if (msg.data) {
@@ -135,9 +143,14 @@ private:
     void jonitCmdCallback(const FloatArray & msg)
     {
         auto joints = msg.data;
-        if(joints.size() == 6) { 
+        if(joints.size() == 6) {
             goToArmJointTarget(joints);
         }
+    }
+
+    void poseCmdCallback(const PoseCommand& msg)
+    {
+        goToArmPoseTarget(msg.x,msg.y,msg.z,msg.roll,msg.pitch,msg.yaw,msg.use_cartisian);
     }
 
 };
