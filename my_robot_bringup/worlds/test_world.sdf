@@ -157,7 +157,7 @@
       <self_collide>false</self_collide>
     </model>
     <model name='box'>
-      <pose>1.93466 -3.45599 0.5 0 0 -0</pose>
+      <pose>-0.679458 -2.14548 0.410989 0 -0 -0</pose>
       <link name='box_link'>
         <inertial>
           <inertia>
@@ -204,7 +204,7 @@
       <self_collide>false</self_collide>
     </model>
     <model name='box_0'>
-      <pose>0.484151 -3.41253 0.5 0 0 -0</pose>
+      <pose>-3.14557 -3.73531 0.462063 0 -0 1.82423</pose>
       <link name='box_link'>
         <inertial>
           <inertia>

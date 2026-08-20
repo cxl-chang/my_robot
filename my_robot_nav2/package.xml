@@ -1,18 +1,17 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>my_robot_interfaces</name>
+  <name>my_robot_nav2</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Nav2 navigation configuration &amp; launch for my_robot (SLAM online mapping + navigation)</description>
   <maintainer email="changxianli6121@163.com">cxl</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <buildtool_depend>rosidl_default_generators</buildtool_depend>
-  <exec_depend>rosidl_runtime_cpp</exec_depend>
-  <depend>geometry_msgs</depend>
-  <member_of_group>rosidl_interface_packages</member_of_group>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>rviz2</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

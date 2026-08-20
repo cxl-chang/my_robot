@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org.wiki/xacro">
+
+    <!-- 2D laser scanner (gz gpu_lidar) mounted on top of the mobile base.
+         Height z=0.25 keeps the scan plane above the base chassis
+         (0.2 m tall) and above the wheels (0.2 m diameter).
+         Publishes GZ topic /scan, bridged to ROS /scan by my_robot_bringup. -->
+
+    
+    <xacro:property name="lidar_length" value="0.01" />
+    <xacro:property name="lidar_radius" value="0.025" />
+
+    <link name="lidar_link">
+        <visual>
+            <geometry>
+                <cylinder radius="${lidar_radius}" length="${lidar_length}"/>
+            </geometry>
+            <material name="orange"/>
+        </visual>
+        <collision>
+            <geometry>
+                <cylinder radius="${lidar_radius}" length="${lidar_length}"/>
+            </geometry>
+        </collision>
+        <xacro:cylinder_inertia m="0.01" r="${lidar_radius}" h="${lidar_length}" o_xyz="0 0 0" o_rpy="0 0 0"/>
+    </link>
+
+    <joint name="base_lidar_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="lidar_link"/>
+        <origin xyz="${base_length/2.0} 0.0 ${base_height/3.0*2.0}" rpy="0.0 0.0 0.0"/>
+    </joint>
+
+    <gazebo reference="lidar_link">
+        <sensor name="gpu_lidar" type="gpu_lidar">
+            <update_rate>10</update_rate>
+            <ray>
+                <scan>
+                    <horizontal>
+                        <samples>360</samples>
+                        <resolution>1</resolution>
+                        <min_angle>-3.14159</min_angle>
+                        <max_angle>3.14159</max_angle>
+                    </horizontal>
+                </scan>
+                <range>
+                    <min>0.1</min>
+                    <max>10.0</max>
+                </range>
+                <noise>
+                    <type>gaussian</type>
+                    <mean>0.0</mean>
+                    <stddev>0.01</stddev>
+                </noise>
+            </ray>
+            <always_on>1</always_on>
+            <visualize>true</visualize>
+            <topic>scan</topic>
+        </sensor>
+    </gazebo>
+</robot>
