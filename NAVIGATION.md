@@ -70,11 +70,18 @@ ros2 topic pub --once /nav_cancel std_msgs/msg/Bool "{data: true}"
 ros2 topic echo /nav_status
 ```
 
-### 5. （可选）保存建好的地图，后续改为 AMCL 定位模式
+### 5. AMCL 固定地图定位模式（替代 SLAM，加载保存的地图）
 ```bash
-ros2 run nav2_map_server map_saver_cli -f ~/ros2_ws/src/my_robot_nav2/config/maps/my_map
+ros2 launch my_robot_nav2 amcl_bringup.launch.py
 ```
-之后可用 `map_server + amcl` 替代 `slam.launch.py`（本地图模式，需补 amcl/map_server 参数段）。
+- 启动 map_server（加载 `config/my_world.yaml/pgm`）+ amcl 定位 + Nav2 导航 + RViz。
+- **启动后必须在 RViz 里用 2D Pose Estimate 点出机器人在地图上的初始位置**（或用 `ros2 topic pub /initialpose`），AMCL 粒子收敛后（`map -> odom` 稳定）才能导航。
+- 也可单独启动定位：`ros2 launch my_robot_nav2 localization.launch.py`。
+- 地图文件在 `my_robot_nav2/config/my_world.{yaml,pgm}`，可用 `map:=/path/to/xxx.yaml` 参数切换；`image` 相对路径会相对 yaml 所在目录解析。
+- 保存地图命令（SLAM 模式下）：
+```bash
+ros2 run nav2_map_server map_saver_cli -f ~/maps/my_map
+```
 
 ## 关键话题 / 动作接口汇总
 
