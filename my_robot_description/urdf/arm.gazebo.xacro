@@ -28,17 +28,8 @@
         <material>Gazebo/Grey</material>
     </gazebo>
 
-    <gazebo>
-        <plugin name="gz::sim::systems::JointStatePublisher" filename="gz-sim-joint-state-publisher-system">
-            <update_rate>10</update_rate>
-            <joint_name>joint1</joint_name>
-            <joint_name>joint2</joint_name>
-            <joint_name>joint3</joint_name>
-            <joint_name>joint4</joint_name>
-            <joint_name>joint5</joint_name>
-            <joint_name>joint6</joint_name>
-        </plugin>
-    </gazebo>
+    <!-- 机械臂关节状态已由 gz_ros2_control（GazeboSimROS2ControlPlugin）经 joint_state_broadcaster 提供，
+         此处不再使用 GZ JointStatePublisher，避免 /joint_states 双源冲突 -->
 
     <!-- add gripper relative to hand begin-->
     <xacro:include filename="gripper.gazebo.xacro" />

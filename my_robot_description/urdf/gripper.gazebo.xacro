@@ -13,11 +13,5 @@
         <material>Gazebo/LightGreen</material>
     </gazebo>
 
-    <gazebo>
-        <plugin name="gz::sim::systems::JointStatePublisher" filename="gz-sim-joint-state-publisher-system">
-            <update_rate>10</update_rate>
-            <joint_name>gripper_left_finger_joint</joint_name>
-            <joint_name>gripper_right_finger_joint</joint_name>
-        </plugin>
-    </gazebo>
+    <!-- 夹爪关节状态已由 gz_ros2_control 经 joint_state_broadcaster 提供，不再使用 GZ JointStatePublisher -->
 </robot>
