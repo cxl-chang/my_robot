@@ -1,9 +1,10 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
     <ros2_control name="Arm" type="system">
+         <!--ros2_control 硬件接口直接接入Gazebo物理仿真替代原
+         mock_components/GenericSystem (纯模拟，不连接 Gazebo，导致 TF 双源冲突)-->
         <hardware>
-            <!-- By default, set up controllers for simulation. This won't work on real hardware -->
-            <plugin>mock_components/GenericSystem</plugin>
+            <plugin>gz_ros2_control/GazeboSimSystem</plugin>
         </hardware>
         <joint name="joint1">
             <command_interface name="position"/>
@@ -47,27 +48,17 @@
                 <param name="initial_value">0.0</param>
             </state_interface>
         </joint>
-
     </ros2_control>
 
-    <ros2_control name="MobileBase" type="system">
-        <hardware>
-            <!-- By default, set up controllers for simulation. This won't work on real hardware -->
-            <plugin>mock_components/GenericSystem</plugin>
-        </hardware>
-        <joint name="base_right_wheel_joint">
-            <command_interface name="velocity"/>
-            <state_interface name="position" />
-            <state_interface name="velocity">
-                <param name="initial_value">0.0</param>
-            </state_interface>
-        </joint>
-        <joint name="base_left_wheel_joint">
-            <command_interface name="velocity"/>
-            <state_interface name="position" />
-            <state_interface name="velocity">
-                <param name="initial_value">0.0</param>
-            </state_interface>
-        </joint>
-    </ros2_control>
+    <!-- 注意：MobileBase（差速轮）不纳入 ros2_control，
+         底盘由 GZ 的 DiffDrive 插件驱动（见 mobile_base_gazebo.xacro），
+         轮子状态经 gazebo_bridge.yaml 桥接发布到 /joint_states -->
+
+    <!-- gz_ros2_control 的 GZ 侧插件：在 Gazebo 仿真中创建 ros2_control 框架（controller_manager），
+         因此 launch 中不再需要独立的 ros2_control_node 节点（参考 gz_ros2_control_demos 示例） -->
+    <gazebo>
+        <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+            <parameters>$(find my_robot_bringup)/config/ros2_controllers.yaml</parameters>
+        </plugin>
+    </gazebo>
 </robot>
