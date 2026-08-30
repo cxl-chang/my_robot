@@ -15,6 +15,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PoseCommand.msg"
   "msg/NavGoal.msg"
   "msg/NavStatus.msg"
+  "msg/ObjectDetection.msg"
+  "msg/TaskCommand.msg"
+  "msg/TaskStatus.msg"
   DEPENDENCIES geometry_msgs
 )
 

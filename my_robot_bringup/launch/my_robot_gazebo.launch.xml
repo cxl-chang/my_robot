@@ -31,10 +31,18 @@
 
     <!-- 机械臂由 gz_ros2_control 驱动：ros2_control 框架由 GZ 侧插件 GazeboSimROS2ControlPlugin 内置创建，
          因此不需要独立的 ros2_control_node 节点，spawner 直接连插件创建的 controller_manager -->
+
+    <!-- <node pkg="controller_manager" exec="ros2_control_node" output="screen">
+        <param name="robot_description"
+                value="$(command 'xacro $(var urdf_path)')" />
+        <param from="$(find-pkg-share my_robot_bringup)/config/ros2_controllers.yaml" />
+    </node> -->
+
     <node pkg="controller_manager" exec="spawner" args="joint_state_broadcaster" />
     <node pkg="controller_manager" exec="spawner" args="arm_controller" />
     <node pkg="controller_manager" exec="spawner" args="gripper_controller" />
     <!-- <node pkg="controller_manager" exec="spawner" args="diff_drive_controller" /> -->
+
 
     <!-- move_group 必须用仿真时钟，否则取不到"当前"关节状态（轨迹执行会 ABORTED） -->
     <include file="$(find-pkg-share my_robot_moveit_config)/launch/move_group.launch.py">

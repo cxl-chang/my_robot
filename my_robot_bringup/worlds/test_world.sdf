@@ -200,7 +200,7 @@
         <pose>0 0 0 0 -0 0</pose>
         <enable_wind>false</enable_wind>
       </link>
-      <static>false</static>
+      <static>true</static>
       <self_collide>false</self_collide>
     </model>
     <model name='box_0'>
@@ -247,9 +247,105 @@
         <pose>0 0 0 0 -0 0</pose>
         <enable_wind>false</enable_wind>
       </link>
-      <static>false</static>
+      <static>true</static>
       <self_collide>false</self_collide>
     </model>
+    <!-- ================= M0: 抓取任务场景（PickTable + red_cube） ================= -->
+    <model name='PickTable'>
+      <static>true</static>
+      <pose>3.0 3.0 0.3 0 -0 0</pose>
+      <link name='table_link'>
+        <collision name='table_collision'>
+          <geometry>
+            <box>
+              <size>1.0 0.8 0.6</size>
+            </box>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>0.8</mu>
+                <mu2>0.8</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name='table_visual'>
+          <geometry>
+            <box>
+              <size>1.0 0.8 0.6</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.3 0.3 0.3 1</ambient>
+            <diffuse>0.6 0.6 0.6 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name='red_cube'>
+      <!-- 待抓取的红色方块：0.05m 立方体，顶面贴 ArUco 标签（DICT_4X4_50, id=0 -> "red_cube"） -->
+      <static>false</static>
+      <pose>3.0 3.0 0.63 0 -0 0</pose>
+      <link name='red_cube_link'>
+        <inertial>
+          <mass>0.1</mass>
+          <inertia>
+            <ixx>4.1666667e-05</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>4.1666667e-05</iyy>
+            <iyz>0</iyz>
+            <izz>4.1666667e-05</izz>
+          </inertia>
+        </inertial>
+        <collision name='cube_collision'>
+          <geometry>
+            <box>
+              <size>0.05 0.05 0.05</size>
+            </box>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>0.8</mu>
+                <mu2>0.8</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name='cube_visual'>
+          <geometry>
+            <box>
+              <size>0.05 0.05 0.05</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.7 0.1 0.1 1</ambient>
+            <diffuse>0.8 0.2 0.2 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <visual name='aruco_tag_visual'>
+          <!-- 顶部贴 ArUco 标签薄片（40mm 标签，视觉贴图 aruco_0.png） -->
+          <pose>0 0 0.02525 0 -0 0</pose>
+          <geometry>
+            <box>
+              <size>0.04 0.04 0.0005</size>
+            </box>
+          </geometry>
+          <material>
+            <script>
+              <uri>file:///home/cxl/ros2_ws/src/my_robot_bringup/worlds/aruco_0.png</uri>
+              <name>Gazebo/DarkGrey</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+    </model>
+
     <light name='sun' type='directional'>
       <pose>0 0 10 0 -0 0</pose>
       <cast_shadows>true</cast_shadows>
