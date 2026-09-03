@@ -43,8 +43,9 @@
             <camera>
                 <horizontal_fov>1.39626345</horizontal_fov>
                 <image>
-                    <width>640</width>
-                    <height>480</height>
+                    <!-- 1280x960：提高分辨率使远处 ArUco 标签像素更多（约翻倍），更易检测 -->
+                    <width>1280</width>
+                    <height>960</height>
                     <format>R8G8B8</format>
                 </image>
                 <clip>
@@ -54,7 +55,7 @@
                 <noise>
                     <type>gaussian</type>
                     <mean>0.0</mean>
-                    <stddev>0.007</stddev>
+                    <stddev>0.0</stddev>
                 </noise>
                 <optical_frame_id>camera_link_optical</optical_frame_id>
                 <camera_info_topic>camera/camera_info</camera_info_topic>

@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""ArUco 物体检测节点（M1）。
+
+输入:
+  /camera/image_raw    sensor_msgs/Image     （Gazebo 相机，RGB 1280x960）
+  /camera/camera_info  sensor_msgs/CameraInfo（相机内参，Gazebo 无畸变）
+输出:
+  /object_detection    my_robot_interfaces/ObjectDetection
+                       (class_id + PoseStamped(camera_link_optical 系) + confidence)
+
+检测 DICT_4X4_50 标签，PnP(CV2) 求 6DoF 位姿。
+id 映射（见 test_world.sdf 的红色方块）：0 -> "red_cube"。
+"""
+
+import math
+
+import cv2
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PoseStamped
+from my_robot_interfaces.msg import ObjectDetection
+from cv_bridge import CvBridge
+
+ARUCO_DICT = cv2.aruco.DICT_4X4_50
+MARKER_SIZE = 0.048  # 48mm，贴在方块 +X 侧面的 ArUco 标签（占满 50mm 侧面）
+ID_CLASS_MAP = {0: "red_cube"}  # id=0 -> red_cube
+
+
+def rotation_matrix_to_quaternion(R):
+    """3x3 旋转矩阵 -> 四元数 (x, y, z, w)"""
+    tr = R[0, 0] + R[1, 1] + R[2, 2]
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        qw = 0.25 * s
+        qx = (R[2, 1] - R[1, 2]) / s
+        qy = (R[0, 2] - R[2, 0]) / s
+        qz = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        qw = (R[2, 1] - R[1, 2]) / s
+        qx = 0.25 * s
+        qy = (R[0, 1] + R[1, 0]) / s
+        qz = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        qw = (R[0, 2] - R[2, 0]) / s
+        qx = (R[0, 1] + R[1, 0]) / s
+        qy = 0.25 * s
+        qz = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        qw = (R[1, 0] - R[0, 1]) / s
+        qx = (R[0, 2] + R[2, 0]) / s
+        qy = (R[1, 2] + R[2, 1]) / s
+        qz = 0.25 * s
+    # 归一化
+    n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    return qx / n, qy / n, qz / n, qw / n
+
+
+class ArucoDetector(Node):
+    def __init__(self):
+        super().__init__('aruco_detector')
+        self.bridge = CvBridge()
+        self.K = None
+        self.D = None
+
+        # 图像/相机信息话题由 ros_gz_bridge 发布，通常为 BestEffort QoS
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5)
+
+        self.image_sub = self.create_subscription(
+            Image, '/camera/image_raw', self.image_cb, sensor_qos)
+        self.caminfo_sub = self.create_subscription(
+            CameraInfo, '/camera/camera_info', self.caminfo_cb, sensor_qos)
+        self.det_pub = self.create_publisher(
+            ObjectDetection, '/object_detection', 10)
+
+        self.aruco_dict = cv2.aruco.Dictionary_get(ARUCO_DICT)
+        self.aruco_params = cv2.aruco.DetectorParameters_create()
+        self.get_logger().info("ArUco detector 启动")
+
+    def caminfo_cb(self, msg: CameraInfo):
+        self.K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        self.D = np.array(msg.d, dtype=np.float64)
+        if not hasattr(self, '_k_logged'):
+            self._k_logged = True
+            self.get_logger().info(f"相机内参已初始化 K={self.K.tolist()}")
+
+    def image_cb(self, msg: Image):
+        if self.K is None:
+            self.get_logger().warn(
+                "收到图像但相机内参未初始化（检查 /camera/camera_info 是否有数据）",
+                throttle_duration_sec=3.0)
+            return
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception as e:
+            self.get_logger().warn(f"cv_bridge 转换失败: {e}")
+            return
+        if not hasattr(self, '_img_logged'):
+            self._img_logged = True
+            self.get_logger().info(
+                f"收到图像 {img.shape[1]}x{img.shape[0]} frame={msg.header.frame_id}")
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # ArUco 检测器只容忍旋转、不容忍镜像；Gazebo 贴图可能把标签镜像。
+        # 检测不到时尝试 3 种翻转方向（诊断：确认是否镜像）
+        candidates = [
+            ("normal", gray),
+            ("hflip", cv2.flip(gray, 1)),
+            ("vflip", cv2.flip(gray, 0)),
+            ("hvflip", cv2.flip(gray, -1)),
+        ]
+        corners = ids = None
+        used_label = "normal"
+        for label, g in candidates:
+            c, i, _ = cv2.aruco.detectMarkers(
+                g, self.aruco_dict, parameters=self.aruco_params)
+            if i is not None and len(i) > 0:
+                corners, ids, used_label = c, i, label
+                break
+        if ids is None or len(corners) == 0:
+            self.get_logger().warn(
+                f"图像 {img.shape[1]}x{img.shape[0]} 中未检测到 ArUco 标签"
+                f"（标签可能太小/太远/角度差/镜像）", throttle_duration_sec=2.0)
+            return
+        if used_label != "normal":
+            self.get_logger().warn(
+                f"标签仅在 {used_label} 方向检测到！确认标签被镜像（Gazebo 贴图方向）")
+
+        rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+            corners, MARKER_SIZE, self.K, self.D)
+
+        for i in range(len(ids)):
+            marker_id = int(ids[i][0])
+            rvec = rvecs[i][0]
+            tvec = tvecs[i][0]
+            R, _ = cv2.Rodrigues(rvec)
+            qx, qy, qz, qw = rotation_matrix_to_quaternion(R)
+
+            pose = PoseStamped()
+            pose.header = msg.header  # frame_id = camera_link_optical
+            pose.pose.position.x = float(tvec[0])
+            pose.pose.position.y = float(tvec[1])
+            pose.pose.position.z = float(tvec[2])
+            pose.pose.orientation.x = qx
+            pose.pose.orientation.y = qy
+            pose.pose.orientation.z = qz
+            pose.pose.orientation.w = qw
+
+            det = ObjectDetection()
+            det.class_id = ID_CLASS_MAP.get(marker_id, f"marker_{marker_id}")
+            det.pose = pose
+            det.confidence = 1.0
+            det.bbox = [0, 0, 0, 0]
+            self.det_pub.publish(det)
+            self.get_logger().info(
+                f"检测到 marker {marker_id} ({det.class_id}) "
+                f"位姿=({tvec[0]:.3f},{tvec[1]:.3f},{tvec[2]:.3f})")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ArucoDetector()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
