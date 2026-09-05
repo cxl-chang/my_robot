@@ -141,6 +141,7 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
+      # 到位精度权衡。
       xy_goal_tolerance: 0.25
       yaw_goal_tolerance: 0.25
     FollowPath:

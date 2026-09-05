@@ -111,30 +111,45 @@ class ArucoDetector(Node):
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # ArUco 检测器只容忍旋转、不容忍镜像；Gazebo 贴图可能把标签镜像。
-        # 检测不到时尝试 3 种翻转方向（诊断：确认是否镜像）
-        candidates = [
-            ("normal", gray),
-            ("hflip", cv2.flip(gray, 1)),
-            ("vflip", cv2.flip(gray, 0)),
-            ("hvflip", cv2.flip(gray, -1)),
+        # 检测参数放宽：允许更小的标签（默认 minMarkerPerimeterRate=0.03 → 边长≥34px，
+        # 距离远时标签被直接过滤导致 rejected=0；降到 0.008 允许边长~9px）
+        self.aruco_params.minMarkerPerimeterRate = 0.008
+
+        # 多尺度检测（原图 1.0 / 放大 1.5 / 放大 2.0）：
+        # 标签像素不足/阈值分割失败时，放大后检测成功率更高。
+        # ArUco 检测器只容忍旋转、不容忍镜像；每级再试 3 种翻转（诊断镜像）。
+        scales = [1.0, 1.5, 2.0]
+        flips = [
+            ("normal", None),
+            ("hflip", 1),
+            ("vflip", 0),
+            ("hvflip", -1),
         ]
         corners = ids = None
+        used_scale = 1.0
         used_label = "normal"
-        for label, g in candidates:
-            c, i, _ = cv2.aruco.detectMarkers(
-                g, self.aruco_dict, parameters=self.aruco_params)
-            if i is not None and len(i) > 0:
-                corners, ids, used_label = c, i, label
+        for scale in scales:
+            g = gray if scale == 1.0 else cv2.resize(
+                gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+            for label, fcode in flips:
+                gg = g if fcode is None else cv2.flip(g, fcode)
+                c, i, _ = cv2.aruco.detectMarkers(
+                    gg, self.aruco_dict, parameters=self.aruco_params)
+                if i is not None and len(i) > 0:
+                    corners, ids, used_scale, used_label = c, i, scale, label
+                    break
+            if ids is not None and len(corners) > 0:
                 break
         if ids is None or len(corners) == 0:
             self.get_logger().warn(
                 f"图像 {img.shape[1]}x{img.shape[0]} 中未检测到 ArUco 标签"
                 f"（标签可能太小/太远/角度差/镜像）", throttle_duration_sec=2.0)
             return
-        if used_label != "normal":
-            self.get_logger().warn(
-                f"标签仅在 {used_label} 方向检测到！确认标签被镜像（Gazebo 贴图方向）")
+        # 放大图上检测到的角点坐标要还原到原图（PnP 用原图内参）
+        corners = [corner / used_scale for corner in corners]
+        if used_scale != 1.0 or used_label != "normal":
+            self.get_logger().info(
+                f"在 scale={used_scale} 方向={used_label} 下检测到标签")
 
         rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
             corners, MARKER_SIZE, self.K, self.D)

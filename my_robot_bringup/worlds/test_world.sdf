@@ -242,7 +242,7 @@
     <model name='red_cube'>
       <!-- 待抓取的红色方块：0.05m 立方体，顶面贴 ArUco 标签（DICT_4X4_50, id=0 -> "red_cube"） -->
       <static>false</static>
-      <pose>3.0 3.0 0.63 0 -0 0</pose>
+      <pose>2.8 3.0 0.63 0 -0 0</pose>
       <link name='red_cube_link'>
         <inertial>
           <mass>0.1</mass>
