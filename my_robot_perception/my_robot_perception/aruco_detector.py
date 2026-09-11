@@ -69,22 +69,58 @@ class ArucoDetector(Node):
         self.K = None
         self.D = None
 
-        # 图像/相机信息话题由 ros_gz_bridge 发布，通常为 BestEffort QoS
-        sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+        # 图像 QoS 可通过参数切换（默认 Reliable，避免 BestEffort 订阅匹配不稳定）
+        self.declare_parameter('image_qos_reliable', True)
+        reliable = self.get_parameter('image_qos_reliable').value
+        self.sensor_qos = QoSProfile(
+            reliability=(ReliabilityPolicy.RELIABLE if reliable
+                         else ReliabilityPolicy.BEST_EFFORT),
             history=HistoryPolicy.KEEP_LAST,
-            depth=5)
+            depth=10)
+        self.get_logger().info(
+            f'图像订阅 QoS: {"RELIABLE" if reliable else "BEST_EFFORT"}')
 
         self.image_sub = self.create_subscription(
-            Image, '/camera/image_raw', self.image_cb, sensor_qos)
+            Image, '/camera/image_raw', self.image_cb, self.sensor_qos)
         self.caminfo_sub = self.create_subscription(
-            CameraInfo, '/camera/camera_info', self.caminfo_cb, sensor_qos)
+            CameraInfo, '/camera/camera_info', self.caminfo_cb, self.sensor_qos)
         self.det_pub = self.create_publisher(
             ObjectDetection, '/object_detection', 10)
 
         self.aruco_dict = cv2.aruco.Dictionary_get(ARUCO_DICT)
         self.aruco_params = cv2.aruco.DetectorParameters_create()
+        # 周期统计（诊断：区分"收不到图像"/"检测不到"/"发布/M9 收不到"）
+        self.frame_count = 0
+        self.detect_count = 0
+        self.no_frame_rounds = 0   # 连续无图像的统计轮数（用于订阅自愈）
+        self.create_timer(5.0, self.stats_cb)
         self.get_logger().info("ArUco detector 启动")
+
+    def stats_cb(self):
+        self.get_logger().info(
+            f'[统计] 近5s: 收到图像 {self.frame_count} 帧, '
+            f'检测到标签 {self.detect_count} 次')
+        if self.frame_count == 0:
+            # 图像订阅失效（无图像 = 不检测 = 不发布），自动重建订阅自愈
+            self.no_frame_rounds += 1
+            if self.no_frame_rounds >= 2:   # 连续 ~10s 无图像
+                self.get_logger().warn(
+                    '连续 10s 未收到图像，重建图像/内参订阅以自愈')
+                try:
+                    self.destroy_subscription(self.image_sub)
+                    self.destroy_subscription(self.caminfo_sub)
+                except Exception as e:
+                    self.get_logger().warn(f'销毁旧订阅失败: {e}')
+                self.image_sub = self.create_subscription(
+                    Image, '/camera/image_raw', self.image_cb, self.sensor_qos)
+                self.caminfo_sub = self.create_subscription(
+                    CameraInfo, '/camera/camera_info',
+                    self.caminfo_cb, self.sensor_qos)
+                self.no_frame_rounds = 0
+        else:
+            self.no_frame_rounds = 0
+        self.frame_count = 0
+        self.detect_count = 0
 
     def caminfo_cb(self, msg: CameraInfo):
         self.K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
@@ -94,6 +130,11 @@ class ArucoDetector(Node):
             self.get_logger().info(f"相机内参已初始化 K={self.K.tolist()}")
 
     def image_cb(self, msg: Image):
+        # 不捕获异常：让 rclpy 打印完整堆栈（便于定位问题），先不做保护
+        self._process_image(msg)
+
+    def _process_image(self, msg: Image):
+        self.frame_count += 1
         if self.K is None:
             self.get_logger().warn(
                 "收到图像但相机内参未初始化（检查 /camera/camera_info 是否有数据）",
@@ -176,8 +217,18 @@ class ArucoDetector(Node):
             det.pose = pose
             det.confidence = 1.0
             det.bbox = [0, 0, 0, 0]
-            self.det_pub.publish(det)
+            self.detect_count += 1
+            try:
+                self.det_pub.publish(det)
+            except Exception as e:
+                self.get_logger().error(f"publish 异常: {e}")
+            # 诊断：确认发布执行 + 订阅者发现情况
+            try:
+                sub_cnt = self.det_pub.get_subscription_count()
+            except Exception:
+                sub_cnt = -1
             self.get_logger().info(
+                f"publish 调用完成，订阅者数={sub_cnt} | "
                 f"检测到 marker {marker_id} ({det.class_id}) "
                 f"位姿=({tvec[0]:.3f},{tvec[1]:.3f},{tvec[2]:.3f})")
 

@@ -109,9 +109,8 @@
       <name>grey_wall_1_2</name>
       <pose>-2.77667 1.57188 -0.964923 0 -0 1.56941</pose>
     </include>
-
     <model name='box'>
-      <pose>-0.679458 -2.14548 0.410989 0 -0 -0</pose>
+      <pose>-0.679458 -2.14548 0.410989 0 -0 0</pose>
       <link name='box_link'>
         <inertial>
           <inertia>
@@ -204,10 +203,9 @@
       <static>true</static>
       <self_collide>false</self_collide>
     </model>
-    <!-- ================= M0: 抓取任务场景（PickTable + red_cube） ================= -->
     <model name='PickTable'>
       <static>true</static>
-      <pose>3.0 3.0 0.1 0 -0 0</pose>
+      <pose>3 3 0.1 0 -0 0</pose>
       <link name='table_link'>
         <collision name='table_collision'>
           <geometry>
@@ -218,10 +216,12 @@
           <surface>
             <friction>
               <ode>
-                <mu>0.8</mu>
-                <mu2>0.8</mu2>
+                <mu>0.80000000000000004</mu>
+                <mu2>0.80000000000000004</mu2>
               </ode>
             </friction>
+            <bounce/>
+            <contact/>
           </surface>
         </collision>
         <visual name='table_visual'>
@@ -236,24 +236,38 @@
             <specular>0.1 0.1 0.1 1</specular>
           </material>
         </visual>
-      </link>
-    </model>
-
-    <model name='red_cube'>
-      <!-- 待抓取的红色方块：0.05m 立方体，顶面贴 ArUco 标签（DICT_4X4_50, id=0 -> "red_cube"） -->
-      <static>false</static>
-      <pose>2.8 3.0 0.63 0 -0 0</pose>
-      <link name='red_cube_link'>
+        <pose>0 0 0 0 -0 0</pose>
         <inertial>
-          <mass>0.1</mass>
+          <pose>0 0 0 0 -0 0</pose>
+          <mass>1</mass>
           <inertia>
-            <ixx>4.1666667e-05</ixx>
+            <ixx>1</ixx>
             <ixy>0</ixy>
             <ixz>0</ixz>
-            <iyy>4.1666667e-05</iyy>
+            <iyy>1</iyy>
             <iyz>0</iyz>
-            <izz>4.1666667e-05</izz>
+            <izz>1</izz>
           </inertia>
+        </inertial>
+        <enable_wind>false</enable_wind>
+      </link>
+      <self_collide>false</self_collide>
+    </model>
+    <model name='red_cube'>
+      <static>false</static>
+      <pose>2.8 3 0.224999 -0 0 -0</pose>
+      <link name='red_cube_link'>
+        <inertial>
+          <mass>0.10000000000000001</mass>
+          <inertia>
+            <ixx>4.1666699999999999e-05</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>4.1666699999999999e-05</iyy>
+            <iyz>0</iyz>
+            <izz>4.1666699999999999e-05</izz>
+          </inertia>
+          <pose>0 0 0 0 -0 0</pose>
         </inertial>
         <collision name='cube_collision'>
           <geometry>
@@ -264,10 +278,12 @@
           <surface>
             <friction>
               <ode>
-                <mu>0.8</mu>
-                <mu2>0.8</mu2>
+                <mu>0.80000000000000004</mu>
+                <mu2>0.80000000000000004</mu2>
               </ode>
             </friction>
+            <bounce/>
+            <contact/>
           </surface>
         </collision>
         <visual name='cube_visual'>
@@ -283,54 +299,127 @@
           </material>
         </visual>
         <!-- 纯几何 ArUco 标签（id=0，黑色底板 + 白色模块，无贴图依赖；Gazebo 贴图不可靠） -->
-        <visual name="aruco_bg">
+        <visual name='aruco_bg'>
           <pose>-0.0270 0 0 0 0 0</pose>
-          <geometry><box><size>0.004 0.048 0.048</size></box></geometry>
-          <material><ambient>0 0 0 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse></material>
+          <geometry>
+            <box>
+              <size>0.004 0.048 0.048</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 0 0 1</ambient>
+            <diffuse>0.1 0.1 0.1 1</diffuse>
+          </material>
         </visual>
-        <visual name="aruco_w0">
+        <visual name='aruco_w0'>
           <pose>-0.0305 0.0120 0.0120 0 0 0</pose>
-          <geometry><box><size>0.002 0.006 0.006</size></box></geometry>
-          <material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse><emissive>1 1 1 1</emissive></material>
+          <geometry>
+            <box>
+              <size>0.002 0.006 0.006</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
         </visual>
-        <visual name="aruco_w1">
+        <visual name='aruco_w1'>
           <pose>-0.0305 -0.0040 0.0120 0 0 0</pose>
-          <geometry><box><size>0.002 0.006 0.006</size></box></geometry>
-          <material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse><emissive>1 1 1 1</emissive></material>
+          <geometry>
+            <box>
+              <size>0.002 0.006 0.006</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
         </visual>
-        <visual name="aruco_w2">
+        <visual name='aruco_w2'>
           <pose>-0.0305 -0.0120 0.0120 0 0 0</pose>
-          <geometry><box><size>0.002 0.006 0.006</size></box></geometry>
-          <material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse><emissive>1 1 1 1</emissive></material>
+          <geometry>
+            <box>
+              <size>0.002 0.006 0.006</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
         </visual>
-        <visual name="aruco_w3">
+        <visual name='aruco_w3'>
           <pose>-0.0305 0.0040 0.0040 0 0 0</pose>
-          <geometry><box><size>0.002 0.006 0.006</size></box></geometry>
-          <material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse><emissive>1 1 1 1</emissive></material>
+          <geometry>
+            <box>
+              <size>0.002 0.006 0.006</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
         </visual>
-        <visual name="aruco_w4">
+        <visual name='aruco_w4'>
           <pose>-0.0305 -0.0120 0.0040 0 0 0</pose>
-          <geometry><box><size>0.002 0.006 0.006</size></box></geometry>
-          <material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse><emissive>1 1 1 1</emissive></material>
+          <geometry>
+            <box>
+              <size>0.002 0.006 0.006</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
         </visual>
-        <visual name="aruco_w5">
+        <visual name='aruco_w5'>
           <pose>-0.0305 -0.0040 -0.0040 0 0 0</pose>
-          <geometry><box><size>0.002 0.006 0.006</size></box></geometry>
-          <material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse><emissive>1 1 1 1</emissive></material>
+          <geometry>
+            <box>
+              <size>0.002 0.006 0.006</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
         </visual>
-        <visual name="aruco_w6">
+        <visual name='aruco_w6'>
           <pose>-0.0305 -0.0120 -0.0040 0 0 0</pose>
-          <geometry><box><size>0.002 0.006 0.006</size></box></geometry>
-          <material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse><emissive>1 1 1 1</emissive></material>
+          <geometry>
+            <box>
+              <size>0.002 0.006 0.006</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
         </visual>
-        <visual name="aruco_w7">
+        <visual name='aruco_w7'>
           <pose>-0.0305 -0.0040 -0.0120 0 0 0</pose>
-          <geometry><box><size>0.002 0.006 0.006</size></box></geometry>
-          <material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse><emissive>1 1 1 1</emissive></material>
+          <geometry>
+            <box>
+              <size>0.002 0.006 0.006</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
         </visual>
+        <pose>0 0 0 0 -0 0</pose>
+        <enable_wind>false</enable_wind>
       </link>
+      <self_collide>false</self_collide>
     </model>
-
     <light name='sun' type='directional'>
       <pose>0 0 10 0 -0 0</pose>
       <cast_shadows>true</cast_shadows>
