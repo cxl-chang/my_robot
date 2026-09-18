@@ -22,6 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
             'task_orchestrator = my_robot_task_orchestrator.orchestrator:main',
+            'task_sender = my_robot_task_orchestrator.task_sender:main',
         ],
     },
 )
