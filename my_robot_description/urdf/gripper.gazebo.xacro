@@ -5,13 +5,111 @@
         <material>Gazebo/DarkGreen</material>
     </gazebo>
 
+    <!-- 指面接触参数。
+         注意别把 kp / mu 调得太硬太高：gz_ros2_control 的位置指令内部是速度量
+         （v = position_proportional_gain × 误差，默认增益 0.1），指爪移动很慢，
+         接触过硬 + 摩擦过高会让指爪被静摩擦"锁死"（详见 gripper.xacro 里
+         关于指爪关节 z 间隙的说明）。这里的值故意与方块自身(mu=0.8)同量级。
+         仿真里真正可靠的抓取靠 DetachableJoint 吸附（见 PICK_PLACE.md），
+         摩擦抓取只是备选路径。 -->
     <gazebo reference="gripper_left_finger_link">
         <material>Gazebo/LightGreen</material>
+        <mu1>0.8</mu1>
+        <mu2>0.8</mu2>
+        <kp>100000.0</kp>
+        <kd>10.0</kd>
     </gazebo>
 
     <gazebo reference="gripper_right_finger_link">
         <material>Gazebo/LightGreen</material>
+        <mu1>0.8</mu1>
+        <mu2>0.8</mu2>
+        <kp>100000.0</kp>
+        <kd>10.0</kd>
     </gazebo>
 
     <!-- 夹爪关节状态已由 gz_ros2_control 经 joint_state_broadcaster 提供，不再使用 GZ JointStatePublisher -->
+
+    <!-- ============================================================
+         仿真专用补丁：用 Gazebo 自带的 JointPositionController 直接驱动右指
+         ============================================================
+         现象：本仿真后端（Ignition Gazebo 6 / Fortress）下，名叫
+         gripper_right_finger_joint 的关节经 gz_ros2_control 完全驱动不了 ——
+         接口 available/claimed、控制器里也含它、JTC 的 error 显示确实在命令它，
+         但关节状态恒为 0（连数值噪声都没有），指爪物理上不动；
+         而 gripper_left_finger_joint 一切正常。
+         根因（已用干净的隔离实验定论）：决定因素是**关节的「轴方向 + 限位取向」组合**
+         —— 只有与左指完全同构的形态（轴 +1、限位 [0, +X]、正向命令）能被驱动：
+           axis +1 + limits [0, 0.06]  → 能动（左指）
+           axis +1 + limits [-0.06, 0] → 不动（右指的原始设计就是这种！）
+           axis -1 + limits [0, 0.06]  → 不动
+         已排除（独立 ROS_DOMAIN_ID + 先摘掉 mirror 后复现）：关节名、<ros2_control>
+         声明顺序、URDF 关节定义顺序、关节 origin、接触摩擦参数、控制器里放几个关节、
+         MoveIt。右指要向内合拢就必须用负向轴或负限位，而这两种恰好都驱动不了，
+         所以仿真里需要下面这条镜像通路。
+         （修正记录：早先写成「按名字绑错实体」是过度推断 —— 交换 origin 时轴是跟着
+         关节名一起走的，我把「轴 −1 不动」误读成了「名字叫 right 的不动」。）
+
+         这里给右指挂一个 Gazebo 原生插件，它自己按名字在本模型里找关节并
+         直接写位置，是一条独立于 gz_ros2_control 的通路；
+         再由 my_robot_bringup 的 gripper_mirror 节点把左指位置镜像到
+         /gripper_right_finger_cmd，两个指爪就能同步开合。
+
+         本插件 + mirror 是可用的绕过方案（已实测两指跟随误差 ≤0.6mm）。
+
+         注意：这只影响仿真。真机上两个指关节都由 ros2_control 正常驱动，
+         ros2_control 侧的配置（双指都在 gripper_controller 里）保持不变。
+         一旦 gz_ros2_control 修好这个问题，删掉本插件 + 桥接 + mirror 节点即可。
+         ============================================================ -->
+    <gazebo>
+        <plugin filename="ignition-gazebo-joint-position-controller-system"
+                name="ignition::gazebo::systems::JointPositionController">
+            <joint_name>gripper_right_finger_joint</joint_name>
+            <topic>/gripper_right_finger_cmd</topic>
+            <initial_position>0.0</initial_position>
+            <p_gain>400</p_gain>
+            <i_gain>8</i_gain>
+            <d_gain>40</d_gain>
+            <i_max>5.0</i_max>
+            <i_min>-5.0</i_min>
+            <cmd_max>100.0</cmd_max>
+            <cmd_min>-100.0</cmd_min>
+        </plugin>
+    </gazebo>
+
+    <!-- ============================================================
+         可选：DetachableJoint 吸附（仿真里保证抓取可靠）
+         ============================================================
+         Gazebo 里的摩擦抓取成功率有限（指爪打滑、方块被顶飞、接触穿透），
+         所以抓取时把方块和夹爪之间硬连一个 fixed joint，松爪时再断开。
+         视觉/规划/状态机代码完全不用改，只在夹紧/松开那一刻多发一条消息。
+
+         用 xacro 参数 use_detachable 控制是否包含本插件（默认关，
+         由 my_robot_gazebo.launch.xml 的 use_detachable 参数传进来），
+         因为插件在 Configure 时就会把两者连起来，需要 orchestrator 上电后
+         先发一次 detach 抵消（见 my_robot_task_orchestrator/orchestrator.py）。
+
+         attach/detach 话题是 Gazebo 传输层话题，经 gazebo_bridge.yaml
+         桥接成 ROS 的 std_msgs/Empty。
+         ============================================================ -->
+    <xacro:if value="$(arg use_detachable)">
+        <gazebo>
+            <plugin filename="ignition-gazebo-detachable-joint-system"
+                    name="ignition::gazebo::systems::DetachableJoint">
+                <!-- 注意这里必须写 hand_link，不能写 gripper_base_link：
+                     URDF→SDF 转换会把固定关节合并（lump），gripper_base_link 被
+                     并进 hand_link，运行时模型里根本没有 gripper_base_link 这个名字，
+                     插件会报 "Link with name gripper_base_link not found ...
+                     Failed to initialize"。hand_link 携带了合并后的夹爪底板碰撞体，
+                     几何上就是夹爪本体，等价。 -->
+                <parent_link>hand_link</parent_link>
+                <child_model>red_cube</child_model>
+                <child_link>red_cube_link</child_link>
+                <attach_topic>/red_cube/attach</attach_topic>
+                <detach_topic>/red_cube/detach</detach_topic>
+                <output_topic>/red_cube/detachable_joint_state</output_topic>
+                <suppress_child_warning>true</suppress_child_warning>
+            </plugin>
+        </gazebo>
+    </xacro:if>
 </robot>

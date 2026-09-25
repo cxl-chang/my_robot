@@ -48,6 +48,19 @@
                 <param name="initial_value">0.0</param>
             </state_interface>
         </joint>
+        <!-- 右指也必须纳入 ros2_control：
+             gripper.xacro 里右指原本用 URDF <mimic joint="gripper_left_finger_joint">
+             跟随左指，但本仿真后端 Ignition Gazebo 6 (Fortress) / sdformat12
+             的 SDF 1.9 规范里没有 mimic 元素，URDF 转 SDF 时 mimic 被丢弃，
+             右指成了一个没有驱动、没有约束的自由滑动关节 —— 表现为"合爪时
+             只有左指动、右指被推着乱跑、夹不住物体"。这里改成双指都直接驱动，
+             由 gripper_controller 同时给两个关节发位置指令。 -->
+        <joint name="gripper_right_finger_joint">
+            <command_interface name="position"/>
+            <state_interface name="position">
+                <param name="initial_value">0.0</param>
+            </state_interface>
+        </joint>
     </ros2_control>
 
     <!-- 注意：MobileBase（差速轮）不纳入 ros2_control，

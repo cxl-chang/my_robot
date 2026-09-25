@@ -18,6 +18,11 @@
   <exec_depend>my_robot_description</exec_depend>
   <exec_depend>controller_manager</exec_depend>
 
+  <!-- scripts/gripper_mirror.py（仿真专用的左指→右指镜像节点） -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

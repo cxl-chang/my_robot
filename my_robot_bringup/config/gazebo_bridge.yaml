@@ -46,3 +46,35 @@
   ros_type_name: "sensor_msgs/msg/Image"
   gz_type_name: "ignition.msgs.Image"
   direction: GZ_TO_ROS
+
+# --- 仿真专用补丁：右指位置指令（见 gripper.gazebo.xacro 的说明）---
+# gz_ros2_control 对名叫 gripper_right_finger_joint 的关节绑定错误（写不进、
+# 读回来恒为 0），所以右指改由 Gazebo 自带的 JointPositionController 插件驱动，
+# 由 gripper_mirror 节点把左指位置镜像过来。
+- ros_topic_name: "/gripper_right_finger_cmd"
+  gz_topic_name: "/gripper_right_finger_cmd"
+  ros_type_name: "std_msgs/msg/Float64"
+  gz_type_name: "ignition.msgs.Double"
+  direction: ROS_TO_GZ
+
+# --- 可选：DetachableJoint 吸附的 attach/detach（见 gripper.gazebo.xacro）---
+# 只有 use_detachable:=true 时 Gazebo 侧才有这两个话题；桥接本身常驻无害。
+- ros_topic_name: "/red_cube/attach"
+  gz_topic_name: "/red_cube/attach"
+  ros_type_name: "std_msgs/msg/Empty"
+  gz_type_name: "ignition.msgs.Empty"
+  direction: ROS_TO_GZ
+
+- ros_topic_name: "/red_cube/detach"
+  gz_topic_name: "/red_cube/detach"
+  ros_type_name: "std_msgs/msg/Empty"
+  gz_type_name: "ignition.msgs.Empty"
+  direction: ROS_TO_GZ
+
+# 吸附状态回执：插件每次成功 attach/detach 会往 output_topic 发一条空消息，
+# 桥出来就能确认吸附到底有没有生效（否则只能靠肉眼在 GUI 里看方块跟不跟手）。
+- ros_topic_name: "/red_cube/attached"
+  gz_topic_name: "/red_cube/detachable_joint_state"
+  ros_type_name: "std_msgs/msg/Empty"
+  gz_type_name: "ignition.msgs.Empty"
+  direction: GZ_TO_ROS

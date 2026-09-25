@@ -64,6 +64,15 @@
         <origin xyz="0 0 0" rpy="0 0 0"/>
     </joint>
 
+    <!-- 指爪关节 origin 的 z = 0.02（原始设计，保持不动）。
+         曾经一度改成 0.03 想"消除指爪与夹爪底板的零间隙接触"，**那是错的**：
+         后续实验证明右指不动与接触参数无关（详见下面 gripper_right_finger_joint
+         的说明），真正原因是 mimic 被丢弃 + gz_ros2_control 对该关节名的写通路缺陷。
+         实测把 z 改回 0.02 之后夹爪开合依然完全正常。
+         注意这个 z 会决定抓取时工具该降到多高（见 PICK_PLACE.md 第六节）：
+         指爪碰撞体在 gripper/tool 系里占 z ∈ [0.02, 0.10]（关节 z + 连杆内偏移
+         0.04 ± 0.04），工具 +Z 朝下时指爪底端落在世界 z = tool_z - 0.10，
+         所以台面 0.40 上抓方块时 tool_z = 0.50 刚好贴到台面且完整包住方块。 -->
     <joint name="gripper_left_finger_joint" type="prismatic">
         <parent link="gripper_base_link"/>
         <child link="gripper_left_finger_link"/>
@@ -76,8 +85,25 @@
         <parent link="gripper_base_link"/>
         <child link="gripper_right_finger_link"/>
         <origin xyz="0.07 0 0.02" rpy="0 0 0"/>
-        <axis xyz="1 0 0"/>
-        <limit lower="-0.06" upper="0.0" effort="1000" velocity="1.0"/>
-        <mimic joint="gripper_left_finger_joint" multiplier="-1"/>
+        <!-- 轴取 -X：正值 = 指爪朝中心合拢。这样两个指关节的约定完全一致
+             （限位都是 [0, 0.06]、正值都是合拢），上层/ SRDF 里两个关节
+             给相同的正值即可，不用再记一个取负、一个取正。
+             原来这里是 axis="1 0 0" + limit [-0.06, 0]（正值=张开），
+             实测在 Ignition Gazebo 6 下该关节的命令完全不被执行
+             （左指正常跟随，右指恒定停在 0），改成与左指同构后正常。 -->
+        <axis xyz="-1 0 0"/>
+        <limit lower="0" upper="0.06" effort="1000" velocity="1.0"/>
+        <!-- 这里原本是 <mimic joint="gripper_left_finger_joint" multiplier="-1"/>，
+             已移除。原因：本仿真后端是 Ignition Gazebo 6 (Fortress)，其
+             sdformat12 的 SDF 1.9 规范里没有 mimic 元素，URDF 经
+             `ros_gz_sim create -topic robot_description` 转 SDF 时 mimic 会被丢弃，
+             右指变成无驱动、无约束的自由关节 —— 合爪时只有左指动、右指被推着乱跑，
+             夹不住任何东西。
+             现在改为双指都由 gripper_controller 直接驱动（见
+             my_robot.ros2_control.xacro）：
+               合到 5cm 方块 → 两指都 +0.035
+               完全闭合     → 两指都 +0.060
+             对应 SRDF 的 gripper_grasp / gripper_closed 命名目标。
+             注意：不要把 mimic 加回来，除非换到支持它的仿真后端。 -->
     </joint>
 </robot>

@@ -24,14 +24,28 @@
         <joint name="gripper_right_finger_joint"/>
     </group>
     <!--GROUP STATES: Purpose: Define a named state for a particular group, in terms of joint values. This is useful to define states like 'folded arms'-->
+    <!--夹爪：两个指关节约定一致（正值 = 合拢），所以两指给相同的值。
+        指根内距 = 0.12 - 2*joint
+          0      -> 内距 0.12m（全开）
+          0.030  -> 内距 0.06m
+          0.035  -> 内距 0.05m  ← 正好夹住 5cm 的 red_cube，用这个抓取
+          0.060  -> 内距 0    （完全闭合，不要用来抓 5cm 方块，会硬顶）
+        gripper_grasp 是抓取专用值，gripper_closed 保留为完全闭合。-->
     <group_state name="gripper_open" group="gripper">
         <joint name="gripper_left_finger_joint" value="0"/>
+        <joint name="gripper_right_finger_joint" value="0"/>
     </group_state>
-    <group_state name="gripper_closed" group="gripper">
-        <joint name="gripper_left_finger_joint" value="0.06"/>
+    <group_state name="gripper_grasp" group="gripper">
+        <joint name="gripper_left_finger_joint" value="0.035"/>
+        <joint name="gripper_right_finger_joint" value="0.035"/>
     </group_state>
     <group_state name="gripper_half_closed" group="gripper">
         <joint name="gripper_left_finger_joint" value="0.03"/>
+        <joint name="gripper_right_finger_joint" value="0.03"/>
+    </group_state>
+    <group_state name="gripper_closed" group="gripper">
+        <joint name="gripper_left_finger_joint" value="0.06"/>
+        <joint name="gripper_right_finger_joint" value="0.06"/>
     </group_state>
     <group_state name="home" group="arm">
         <joint name="joint1" value="0"/>
@@ -40,6 +54,21 @@
         <joint name="joint4" value="0"/>
         <joint name="joint5" value="0"/>
         <joint name="joint6" value="0"/>
+    </group_state>
+    <!--carry：搬运（导航）时的手臂收起姿态，工具位姿 (0.30, 0, 0.80)、工具 +Z 朝下。
+        为什么必须有这个姿态：lidar 扫描平面在 base_footlink 系 z≈0.233，
+        手臂抓着方块停在身前 0.2~0.4m 高度时，2D 激光会把方块当成障碍物写进
+        local costmap，Nav2 会直接卡死不动。carry 把被抓物体抬到 z≈0.74，
+        并且收在底盘正上方（x=0.30），既不挡激光也不超出 footprint。
+        关节角由 my_robot_moveit_config/scripts/arm_kinematics.py 反解得到
+        （位置误差 0.0mm / 姿态误差 0.00deg）。改 URDF 尺寸后需重跑该脚本。-->
+    <group_state name="carry" group="arm">
+        <joint name="joint1" value="0"/>
+        <joint name="joint2" value="-0.9531"/>
+        <joint name="joint3" value="0.2581"/>
+        <joint name="joint4" value="0"/>
+        <joint name="joint5" value="1.0366"/>
+        <joint name="joint6" value="-3.1416"/>
     </group_state>
     <group_state name="pose_1" group="arm">
         <joint name="joint1" value="0"/>

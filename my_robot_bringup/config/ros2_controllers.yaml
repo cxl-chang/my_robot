@@ -32,8 +32,12 @@ arm_controller:
       - position
 gripper_controller:
   ros__parameters:
+    # 双指都直接驱动（右指原来的 URDF mimic 在 Ignition Gazebo 6 里不生效，
+    # 见 gripper.xacro 的说明）。两个指关节约定一致，正值都是"合拢"：
+    #   张开 0/0，夹住 5cm 方块 0.035/0.035，完全闭合 0.06/0.06
     joints:
       - gripper_left_finger_joint
+      - gripper_right_finger_joint
     command_interfaces:
       - position
     state_interfaces:

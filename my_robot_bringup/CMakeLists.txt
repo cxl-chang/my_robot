@@ -16,4 +16,11 @@ install (
   DESTINATION share/${PROJECT_NAME}/
 )
 
+# 仿真专用小工具：把左指位置镜像给右指（见 scripts/gripper_mirror.py 的说明）
+install(PROGRAMS
+  scripts/gripper_mirror.py
+  scripts/check_gripper.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

@@ -29,8 +29,10 @@ arm_controller:
       - position
 gripper_controller:
   ros__parameters:
+    # 与 my_robot_bringup/config/ros2_controllers.yaml 保持一致：双指都直接驱动
     joints:
       - gripper_left_finger_joint
+      - gripper_right_finger_joint
     command_interfaces:
       - position
     state_interfaces:

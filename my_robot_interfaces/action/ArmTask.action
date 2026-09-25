@@ -1,0 +1,26 @@
+# 机械臂/夹爪任务接口（M11）
+# 方向: my_robot_task_orchestrator（action client） → my_robot_commander（action server）
+#
+# 为什么需要它：原来的 /pose_cmd、/joint_cmd、/gripper_cmd 是 fire-and-forget 话题，
+# 编排节点发完无法知道"规划成功没有 / 执行完成没有"。抓取放置必须能判断
+# 成功与超时，否则只能靠 sleep 硬等，失败也无从重试。
+
+# task_type 取值
+string NAMED=named      # 走 MoveIt 命名目标（group_state），用 group_name + named_target
+string POSE=pose        # 走 MoveIt 位姿目标，用 target_pose
+string JOINT=joint      # 走 MoveIt 关节目标，用 joint_values
+
+string task_type        # 见上面常量
+string group_name       # task_type=NAMED 时用："arm" 或 "gripper"
+string named_target     # task_type=NAMED 时用，如 "carry" / "gripper_open" / "gripper_grasp"
+geometry_msgs/Pose target_pose   # task_type=POSE 时用，坐标系固定为 base_footlink
+float64[] joint_values  # task_type=JOINT 时用，按 joint1..joint6 顺序
+bool use_cartesian      # task_type=POSE 时是否走笛卡尔直线（抓取的竖直进给必须 true，
+                        # 否则 MoveIt 可能选到另一组 IK 解，产生关节空间大跳变）
+float64 timeout         # 秒；<=0 表示用服务端默认
+---
+bool success            # 规划并执行成功才为 true
+string message          # 失败原因，或成功时的补充信息（如笛卡尔完成比例）
+---
+string phase            # planning / executing / done
+float64 progress        # 0.0~1.0 粗略进度

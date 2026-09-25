@@ -20,7 +20,10 @@ moveit_simple_controller_manager:
     default: true
   gripper_controller:
     type: FollowJointTrajectory
+    # 双指都要列出来：MoveIt 的 gripper 组含两个关节，SimpleControllerManager
+    # 需要它们全部映射到同一个控制器，否则夹爪轨迹会被判为"无控制器可执行"。
     joints:
       - gripper_left_finger_joint
+      - gripper_right_finger_joint
     action_ns: follow_joint_trajectory
     default: true
