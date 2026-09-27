@@ -18,6 +18,7 @@
 //   即使是多线程执行器也会互相饿死 → plan() 卡死。
 //   所以 action server 挂在独立回调组，主函数用 MultiThreadedExecutor。
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -60,11 +61,19 @@ public:
         action_cb_group_ = node_->create_callback_group(
             rclcpp::CallbackGroupType::MutuallyExclusive);
 
+        // 规划预算上限（秒）。**必须明显小于调用方的 arm_timeout**：
+        // 之前把 planner 预算直接设成 goal->timeout（两边都是 60s），结果规划
+        // 正好在第 60.0016s 出解，而 orchestrator 的 60s 超时同时触发 → 判超时、
+        // 发取消 → 任务失败。规划 + 执行 + 传输都要在这个 timeout 之内，所以
+        // 给规划单独设一个上限。
+        node_->declare_parameter("plan_time_cap", 20.0);
+        plan_time_cap_ = node_->get_parameter("plan_time_cap").as_double();
+
         arm = std::make_shared<MoveGroupInterface>(node_, "arm");
         arm->setMaxAccelerationScalingFactor(1.0);
         arm->setMaxVelocityScalingFactor(1.0);
         arm->setPlanningTime(10.0);
-        arm->setNumPlanningAttempts(5);
+        arm->setNumPlanningAttempts(10);   // 采样规划有随机性，多试几次提高成功率
 
         gripper = std::make_shared<MoveGroupInterface>(node_, "gripper");
         gripper->setMaxAccelerationScalingFactor(1.0);
@@ -161,6 +170,23 @@ public:
 
         if (!use_cartesian)
         {
+            // 【重要】位姿目标改成"先解一次 IK，再用关节目标规划"。
+            //
+            // 原因：OMPL 对**位姿目标**要在目标区域反复采样 IK 才能判定是否到达，
+            // 而本臂 IK 在目标位姿附近的可解区域很窄，实测一个自由空间位姿能耗光
+            // 整个规划预算（60s）甚至根本规划不出来；而**关节目标**是秒级完成的
+            // （SRDF 里的 carry 等命名目标就是关节目标，一直是 ~1s）。
+            //
+            // setApproximateJointValueTarget() 内部做一次 IK，并把结果当作
+            // JointValueTarget 交给规划器 —— 既保留"按位姿下指令"的接口语义，
+            // 又让规划退化成关节空间问题。
+            if (arm->setApproximateJointValueTarget(target_pose))
+            {
+                return planAndExecute(arm, "arm -> pose(IK+关节目标)", err);
+            }
+            // IK 未解出：回退为原来的位姿目标（会很慢，但至少不直接失败）
+            RCLCPP_WARN(node_->get_logger(),
+                        "位姿 IK 未解出，回退为原始位姿目标规划（可能很慢）");
             arm->setPoseTarget(target_pose);
             return planAndExecute(arm, "arm -> pose(自由规划)", err);
         }
@@ -244,7 +270,13 @@ public:
 
         if (goal->timeout > 0.0)
         {
-            arm->setPlanningTime(goal->timeout);
+            // 规划只花掉 timeout 的一部分，给执行/传输留余量（避免与调用方的
+            // 超时判定在同一时刻撞车，见构造函数里的说明）
+            const double budget = std::min(goal->timeout, plan_time_cap_);
+            arm->setPlanningTime(budget);
+            RCLCPP_INFO(node_->get_logger(),
+                        "本次规划预算 %.1fs（goal.timeout=%.1fs，上限 %.1fs）",
+                        budget, goal->timeout, plan_time_cap_);
         }
 
         std::string err;
@@ -314,6 +346,7 @@ private:
     rclcpp::CallbackGroup::SharedPtr action_cb_group_;
     rclcpp_action::Server<ArmTask>::SharedPtr action_server_;
     std::atomic<bool> busy_{false};
+    double plan_time_cap_ = 20.0;   // 规划预算上限，见构造函数注释
 
     // ---------- 话题回调（手动调试用，忽略成功与否） ----------
     void openGripper()  { std::string e; goNamed("gripper", "gripper_open", e); }

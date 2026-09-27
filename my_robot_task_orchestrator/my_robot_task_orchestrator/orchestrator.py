@@ -90,6 +90,12 @@ class TaskOrchestrator(Node):
         self.declare_parameter('pregrasp_z', 0.60)
         self.declare_parameter('grasp_z', 0.50)
         self.declare_parameter('lift_z', 0.70)
+        self.declare_parameter('carry_tool_x', 0.30)
+        self.declare_parameter('carry_tool_z', 0.80)
+        # 收起搬运的目标**工具位姿**（不是关节目标）：工具抬到 0.80、收到底盘
+        # 正上方 x=0.30，物体 z≈0.74 高于激光面。用笛卡尔直线走过去而不是
+        # 用 SRDF 的 carry 关节目标 —— 实测采样规划到 carry 偶尔会耗光预算
+        # 失败（OMPL 随机性），笛卡尔路径是确定性的且完成度 100%。
         self.declare_parameter('tool_roll', math.pi)     # 工具 +Z 朝下
         self.declare_parameter('tool_pitch', 0.0)
         self.declare_parameter('tool_yaw', 0.0)
@@ -128,6 +134,8 @@ class TaskOrchestrator(Node):
         self.pregrasp_z = g('pregrasp_z').value
         self.grasp_z = g('grasp_z').value
         self.lift_z = g('lift_z').value
+        self.carry_tool_x = g('carry_tool_x').value
+        self.carry_tool_z = g('carry_tool_z').value
         self.tool_rpy = (g('tool_roll').value, g('tool_pitch').value,
                          g('tool_yaw').value)
         self.place_standoff = g('place_standoff').value
@@ -363,7 +371,10 @@ class TaskOrchestrator(Node):
             self._op_goal('抬起',
                           self._goal_pose(self.tool_x, self.tool_y,
                                           self.lift_z, True)),
-            self._op_goal('收起搬运', self._goal_named('arm', 'carry')),
+            # 收起搬运：走**笛卡尔**到 carry 的工具位姿（确定性强于采样规划到 carry 关节目标）
+            self._op_goal('收起搬运',
+                          self._goal_pose(self.carry_tool_x, 0.0,
+                                          self.carry_tool_z, True)),
         ]
         return ops
 
