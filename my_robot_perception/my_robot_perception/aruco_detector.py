@@ -26,7 +26,8 @@ from my_robot_interfaces.msg import ObjectDetection
 from cv_bridge import CvBridge
 
 ARUCO_DICT = cv2.aruco.DICT_4X4_50
-MARKER_SIZE = 0.048  # 48mm，贴在方块 +X 侧面的 ArUco 标签（占满 50mm 侧面）
+MARKER_SIZE = 0.032  # 32mm = 黑标签边长（含 1 模块黑边）；
+                         # 世界文件里是 32mm 黑底板 + 46mm 白衬底（ArUco 需要浅色边环）
 ID_CLASS_MAP = {0: "red_cube"}  # id=0 -> red_cube
 
 
@@ -80,6 +81,21 @@ class ArucoDetector(Node):
         self.get_logger().info(
             f'图像订阅 QoS: {"RELIABLE" if reliable else "BEST_EFFORT"}')
 
+        # 处理限频（重要）：每帧要做 3 个尺度 × 4 种翻转 = 最多 12 次
+        # detectMarkers，而且在"看不到标签"时会把 12 遍全部跑完（放大到 2 倍
+        # 即 2560x1920）。相机 20Hz 全速空转会把 CPU 打满，实测会把同机的
+        # MoveIt 规划饿到超时、Gazebo 实时率掉到 0.4（/scan 只有 3.8Hz）。
+        # 机器人做任务时是静止观测，5Hz 完全够用。
+        # 设为 0 表示不限频（恢复原来的"每帧都处理"行为）。
+        self.declare_parameter('max_rate_hz', 5.0)
+        max_rate = float(self.get_parameter('max_rate_hz').value)
+        self._min_period_ns = 0 if max_rate <= 0 else int(1e9 / max_rate)
+        self._last_proc_ns = 0
+        self.skipped_count = 0
+        self.get_logger().info(
+            '检测限频: ' + ('不限' if self._min_period_ns == 0
+                          else f'{max_rate:.1f}Hz'))
+
         self.image_sub = self.create_subscription(
             Image, '/camera/image_raw', self.image_cb, self.sensor_qos)
         self.caminfo_sub = self.create_subscription(
@@ -98,8 +114,10 @@ class ArucoDetector(Node):
 
     def stats_cb(self):
         self.get_logger().info(
-            f'[统计] 近5s: 收到图像 {self.frame_count} 帧, '
+            f'[统计] 近5s: 处理图像 {self.frame_count} 帧, '
+            f'限频丢弃 {self.skipped_count} 帧, '
             f'检测到标签 {self.detect_count} 次')
+        self.skipped_count = 0
         if self.frame_count == 0:
             # 图像订阅失效（无图像 = 不检测 = 不发布），自动重建订阅自愈
             self.no_frame_rounds += 1
@@ -130,6 +148,13 @@ class ArucoDetector(Node):
             self.get_logger().info(f"相机内参已初始化 K={self.K.tolist()}")
 
     def image_cb(self, msg: Image):
+        # 限频：超过上限的图像直接丢弃（丢帧比拖垮 CPU 好）
+        if self._min_period_ns:
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - self._last_proc_ns < self._min_period_ns:
+                self.skipped_count += 1
+                return
+            self._last_proc_ns = now_ns
         # 不捕获异常：让 rclpy 打印完整堆栈（便于定位问题），先不做保护
         self._process_image(msg)
 
@@ -184,7 +209,8 @@ class ArucoDetector(Node):
         if ids is None or len(corners) == 0:
             self.get_logger().warn(
                 f"图像 {img.shape[1]}x{img.shape[0]} 中未检测到 ArUco 标签"
-                f"（标签可能太小/太远/角度差/镜像）", throttle_duration_sec=2.0)
+                f"（常见原因：标签在画面外——相机水平视场看不到台面上的物体；"
+                f"或太远太小、角度太斜、被遮挡）", throttle_duration_sec=3.0)
             return
         # 放大图上检测到的角点坐标要还原到原图（PnP 用原图内参）
         corners = [corner / used_scale for corner in corners]
@@ -212,11 +238,17 @@ class ArucoDetector(Node):
             pose.pose.orientation.z = qz
             pose.pose.orientation.w = qw
 
+            # 标签在图像里的包围盒（原来恒为 [0,0,0,0]，诊断时完全没用）
+            c = corners[i].reshape(-1, 2)
+            x0, y0 = c.min(axis=0)
+            x1, y1 = c.max(axis=0)
+            bbox = [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
+
             det = ObjectDetection()
             det.class_id = ID_CLASS_MAP.get(marker_id, f"marker_{marker_id}")
             det.pose = pose
             det.confidence = 1.0
-            det.bbox = [0, 0, 0, 0]
+            det.bbox = bbox
             self.detect_count += 1
             try:
                 self.det_pub.publish(det)
@@ -228,9 +260,11 @@ class ArucoDetector(Node):
             except Exception:
                 sub_cnt = -1
             self.get_logger().info(
-                f"publish 调用完成，订阅者数={sub_cnt} | "
-                f"检测到 marker {marker_id} ({det.class_id}) "
-                f"位姿=({tvec[0]:.3f},{tvec[1]:.3f},{tvec[2]:.3f})")
+                f"检测到 marker {marker_id} ({det.class_id}) | "
+                f"位姿=({tvec[0]:.3f},{tvec[1]:.3f},{tvec[2]:.3f}) | "
+                f"像素框 {bbox[2]}x{bbox[3]}px @ ({bbox[0] + bbox[2] // 2},"
+                f"{bbox[1] + bbox[3] // 2}) | scale={used_scale} "
+                f"{used_label} | 订阅者数={sub_cnt}")
 
 
 def main(args=None):

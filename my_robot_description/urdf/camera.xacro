@@ -5,6 +5,18 @@
     <xacro:property name="camera_width" value="0.1" />
     <xacro:property name="camera_height" value="0.05" />
 
+    <!-- 相机上仰角（rad）。负值 = 镜头朝上（ROS 里绕 +Y 的正俯仰是朝下）。
+         为什么必须上仰：相机装在 base_footlink 的 z=0.2 处、原本水平朝前，
+         而取件台上的方块标签在 z≈0.425 —— 在观测距离 0.3~0.5m 处仰角高达
+         24°~37°，而相机垂直半视场只有 32.2°（horizontal_fov 80°/1280x960）。
+         结果就是：**默认观测点 (2.2,3.0) 下标签整个在画面上方之外（v 像素
+         范围 [-125,-60]，全为负），根本检测不到**，表现为"识别阶段极不稳定"。
+         实测（把方块/标签按真实位姿投影到图像平面）：
+           pitch=0      → obs_x 2.2 出框、2.1 出框、2.0/1.9 才勉强可见（贴顶边）
+           pitch=-0.36  → obs_x 1.9~2.2 全部可见，上方余量 ≥235px  ← 选这个
+         改这个值必须重新确认：方块标签应落在图像 v ∈ (0, 960) 且远离上边缘。 -->
+    <xacro:property name="camera_pitch" value="-0.36" />
+
     <link name="camera_link">
         <visual>
             <geometry>
@@ -35,7 +47,8 @@
     <joint name="base_camera_joint" type="fixed">
         <parent link="base_link"/>
         <child link="camera_link"/>
-        <origin xyz="${(base_length + camera_length)/2.0} 0 ${base_height/2.0}" rpy="0.0 0.0 0.0"/>
+        <origin xyz="${(base_length + camera_length)/2.0} 0 ${base_height/2.0}"
+                rpy="0.0 ${camera_pitch} 0.0"/>
     </joint>
 
     <gazebo reference="camera_link">
