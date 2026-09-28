@@ -19,8 +19,10 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import (QoSProfile, ReliabilityPolicy, HistoryPolicy,
+                       DurabilityPolicy)
 from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import Bool
 from geometry_msgs.msg import PoseStamped
 from my_robot_interfaces.msg import ObjectDetection
 from cv_bridge import CvBridge
@@ -96,6 +98,23 @@ class ArucoDetector(Node):
             '检测限频: ' + ('不限' if self._min_period_ns == 0
                           else f'{max_rate:.1f}Hz'))
 
+        # ---------------- 识别使能开关 ----------------
+        # 只有"识别窗口"（机器人在观测点稳定后）才需要跑检测；抓取、搬运、
+        # 放置阶段以及导航途中都不需要，跑着纯粹白烧 CPU（每帧最多 12 遍
+        # detectMarkers）。由 orchestrator 通过 /detection_enable 控制。
+        #
+        # 用 **transient_local（锁存）** QoS：晚加入的订阅者也能立刻收到最后一次
+        # 状态，避免"orchestrator 先发了 disable、detector 后启动错过消息"或反过来
+        # "enable 消息丢了导致任务永远识别不到"这类时序问题。
+        self.declare_parameter('enable_topic', '/detection_enable')
+        self.declare_parameter('start_enabled', True)   # 无人控制时的默认状态
+        self.enable_topic = self.get_parameter('enable_topic').value
+        self.enabled = bool(self.get_parameter('start_enabled').value)
+        self.enable_qos = QoSProfile(depth=1,
+                                     durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.enable_sub = self.create_subscription(
+            Bool, self.enable_topic, self.enable_cb, self.enable_qos)
+
         self.image_sub = self.create_subscription(
             Image, '/camera/image_raw', self.image_cb, self.sensor_qos)
         self.caminfo_sub = self.create_subscription(
@@ -115,8 +134,9 @@ class ArucoDetector(Node):
     def stats_cb(self):
         self.get_logger().info(
             f'[统计] 近5s: 处理图像 {self.frame_count} 帧, '
-            f'限频丢弃 {self.skipped_count} 帧, '
-            f'检测到标签 {self.detect_count} 次')
+            f'丢弃 {self.skipped_count} 帧, '
+            f'检测到标签 {self.detect_count} 次, '
+            f'识别{"已开启" if self.enabled else "已暂停"}')
         self.skipped_count = 0
         if self.frame_count == 0:
             # 图像订阅失效（无图像 = 不检测 = 不发布），自动重建订阅自愈
@@ -147,7 +167,19 @@ class ArucoDetector(Node):
             self._k_logged = True
             self.get_logger().info(f"相机内参已初始化 K={self.K.tolist()}")
 
+    def enable_cb(self, msg: Bool):
+        if bool(msg.data) == self.enabled:
+            return
+        self.enabled = bool(msg.data)
+        self.get_logger().info(
+            '物体识别已' + ('开启' if self.enabled else '暂停')
+            + f'（收到 {self.enable_topic}={self.enabled}）')
+
     def image_cb(self, msg: Image):
+        # 未使能：直接丢帧（连转换都不做）
+        if not self.enabled:
+            self.skipped_count += 1
+            return
         # 限频：超过上限的图像直接丢弃（丢帧比拖垮 CPU 好）
         if self._min_period_ns:
             now_ns = self.get_clock().now().nanoseconds

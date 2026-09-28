@@ -35,8 +35,9 @@ import math
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import (QoSProfile, DurabilityPolicy)
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Empty
+from std_msgs.msg import Bool, Empty
 from my_robot_interfaces.msg import (
     TaskCommand, TaskStatus, NavGoal, NavStatus, ObjectDetection)
 from my_robot_interfaces.action import ArmTask
@@ -82,6 +83,8 @@ class TaskOrchestrator(Node):
         self.declare_parameter('move_duration', 0.6)    # 前进时长 s（≈9cm）
         self.declare_parameter('back_duration', 1.2)    # 后退时长 s（≈18cm，步子更大）
         self.declare_parameter('settle_time', 1.5)
+        # 物体识别使能开关话题（详见 aruco_detector.py）
+        self.declare_parameter('detect_enable_topic', '/detection_enable')
         # --- M12 抓取 ---
         self.declare_parameter('enable_pick', True)
         self.declare_parameter('grasp_forward', 0.175)   # 观测点→抓取点前进距离
@@ -160,6 +163,12 @@ class TaskOrchestrator(Node):
         self.nav_pub = self.create_publisher(NavGoal, '/nav_cmd', 10)
         self.status_pub = self.create_publisher(TaskStatus, '/task_status', 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        # 识别使能：只在识别窗口打开，其余阶段（导航/抓取/搬运/放置）关掉，
+        # 省掉每帧最多 12 遍 detectMarkers 的 CPU 开销。
+        # 用 transient_local（锁存）保证 detector 晚启动也能收到最后一次状态。
+        self.detect_enable_pub = self.create_publisher(
+            Bool, self.get_parameter('detect_enable_topic').value,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.attach_pub = self.create_publisher(Empty, self.attach_topic, 10)
         self.detach_pub = self.create_publisher(Empty, self.detach_topic, 10)
         self.arm_client = ActionClient(self, ArmTask, '/arm_task')
@@ -215,6 +224,12 @@ class TaskOrchestrator(Node):
         msg.phase = self.phase
         self.status_pub.publish(msg)
 
+    def _set_detect(self, on, why=''):
+        """开关物体识别（发给 aruco_detector；锁存话题，重复发无害）"""
+        self.detect_enable_pub.publish(Bool(data=bool(on)))
+        self.get_logger().info(
+            f'物体识别{"开启" if on else "暂停"}' + (f'（{why}）' if why else ''))
+
     def _now(self):
         return self.get_clock().now()
 
@@ -229,6 +244,7 @@ class TaskOrchestrator(Node):
             return
         self.task = msg
         self.target_class = msg.object_id
+        self._set_detect(False, '导航阶段不需要识别')
         self.retry = 0
         self.object_pose = None
         self.get_logger().info(
@@ -305,6 +321,7 @@ class TaskOrchestrator(Node):
                 f'识别到 {msg.class_id}，位姿(camera 系)='
                 f'({msg.pose.pose.position.x:.3f},{msg.pose.pose.position.y:.3f},'
                 f'{msg.pose.pose.position.z:.3f})')
+            self._set_detect(False, '已识别到目标，抓取及之后不再需要')
             self._begin_pick()
 
     def _begin_pick(self):
@@ -542,6 +559,7 @@ class TaskOrchestrator(Node):
                 nxt, self.settle_next = self.settle_next, None
                 if nxt == 'DETECT':
                     self.stage = 'DETECT'
+                    self._set_detect(True, '进入识别窗口')
                     self._pub_status(None, '识别中')
                     self._reset_detect()
                     self.get_logger().info('已稳定，开始识别')
@@ -589,6 +607,7 @@ class TaskOrchestrator(Node):
         elif self.phase == '稳定等待' and self.settle_start is not None and \
                 (now - self.settle_start).nanoseconds / 1e9 > self.settle_time:
             self._pub_status(None, '识别中')
+            self._set_detect(True, '对准后继续识别')
             self._reset_detect()
             self.get_logger().info('已稳定，继续识别')
 
@@ -627,6 +646,7 @@ class TaskOrchestrator(Node):
 
     # ================= 收尾 =================
     def _task_done(self):
+        self._set_detect(False, '任务结束')
         self._pub_status(TaskStatus.IDLE, '任务完成')
         self.stage = 'IDLE'
         self.task = None
@@ -637,6 +657,7 @@ class TaskOrchestrator(Node):
         self.ops = None
         self.op_kind = None
         self.get_logger().error(f'任务失败：{reason}')
+        self._set_detect(False, '任务失败')
         # 若失败发生在"已吸附"之后（例如抓起后导航到放置点失败），必须补一次
         # detach，否则方块会一直粘在夹爪上，场景再也回不到初始状态。
         if self.attach_enabled:
