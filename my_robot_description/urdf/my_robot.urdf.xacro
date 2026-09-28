@@ -1,5 +1,11 @@
 <?xml version="1.0"?>
 <robot name="my_robot" xmlns:xacro="http://www.ros.org.wiki/xacro">
+    <!-- 是否包含 DetachableJoint 吸附插件（仿真用；见 gripper.gazebo.xacro）。
+         默认关：该插件在 Configure 阶段就会把方块与夹爪连起来，需要额外处理，
+         所以只有明确需要时（由 my_robot_gazebo.launch.xml 的 use_detachable
+         参数传进来）才打开。 -->
+    <xacro:arg name="use_detachable" default="false"/>
+
     <xacro:include filename="common_properties.xacro"/>
     <xacro:include filename="mobile_base.xacro" />
     <xacro:include filename="mobile_base_gazebo.xacro" />

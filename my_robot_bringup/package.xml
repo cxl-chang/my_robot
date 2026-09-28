@@ -18,6 +18,16 @@
   <exec_depend>my_robot_description</exec_depend>
   <exec_depend>controller_manager</exec_depend>
 
+  <!-- demo_all.launch.py 一键启动依赖的包 -->
+  <exec_depend>my_robot_nav2</exec_depend>
+  <exec_depend>my_robot_nav_commander</exec_depend>
+  <exec_depend>my_robot_perception</exec_depend>
+  <exec_depend>my_robot_task_orchestrator</exec_depend>
+  <exec_depend>my_robot_commander_cpp</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>my_robot_interfaces</exec_depend>
+
   <!-- scripts/gripper_mirror.py（仿真专用的左指→右指镜像节点） -->
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>

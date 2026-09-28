@@ -172,8 +172,10 @@ def generate_launch_description():
             'pregrasp_z', default_value='0.60',
             description='预抓取工具高度（自由规划用，要高于可规划下限 ~0.45）'),
         DeclareLaunchArgument(
-            'grasp_z', default_value='0.495',
-            description='抓取工具高度（= 方块中心 z + 0.07；笛卡尔下压终点）'),
+            'grasp_z', default_value='0.50',
+            description='抓取工具高度（笛卡尔下压终点）。这个值由指爪长度决定：'
+                        '指爪底端在世界 z = grasp_z - 0.10，台面 0.40 → 0.50 刚好贴面'
+                        '且完整包住方块。改指关节 origin 的 z 必须同步改这里'),
         DeclareLaunchArgument(
             'lift_z', default_value='0.70', description='抬起工具高度'),
         DeclareLaunchArgument(

@@ -18,6 +18,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ObjectDetection.msg"
   "msg/TaskCommand.msg"
   "msg/TaskStatus.msg"
+  "action/ArmTask.action"
   DEPENDENCIES geometry_msgs
 )
 

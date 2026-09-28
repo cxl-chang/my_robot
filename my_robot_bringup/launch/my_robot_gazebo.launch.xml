@@ -1,4 +1,12 @@
 <launch>
+    <!-- Gazebo 启动参数。默认带 GUI。无 GUI（服务器 / CI / 自动化验证）时覆盖它，
+         让 gz sim 只跑 server 并立即开始仿真（-s 只起 server，-r 立即运行）：
+           ros2 launch my_robot_bringup my_robot_gazebo.launch.xml \
+             gz_args:="-s -r <world.sdf 的绝对路径>"
+         注意：XML 注释里不能出现连续两个减号，所以上面用 shell 换行写法描述。 -->
+    <arg name="gz_args"
+         default="$(find-pkg-share my_robot_bringup)/worlds/test_world.sdf -r" />
+
     <let name="urdf_path"
          value="$(find-pkg-share my_robot_description)/urdf/my_robot.urdf.xacro" />
 
@@ -11,16 +19,21 @@
     <let name="rviz_config_path"
         value="$(find-pkg-share my_robot_description)/rviz/config_camera_arm.rviz" />
 
+    <!-- 是否给夹爪挂 DetachableJoint 吸附插件（仿真抓取可靠性用）。
+         默认关：该插件一 Configure 就会把 red_cube 硬连到夹爪上，
+         必须有人在上电后发一次 detach 才能抵消 —— 所以只有跑完整 demo
+         （demo_all.launch.py，orchestrator 会做上电脱开）时才建议打开。 -->
+    <arg name="use_detachable" default="false" />
+
     <node pkg="robot_state_publisher" exec="robot_state_publisher">
         <param name="robot_description"
-                value="$(command 'xacro $(var urdf_path)')" />
+                value="$(command 'xacro $(var urdf_path) use_detachable:=$(var use_detachable)')" />
         <!-- Gazebo 仿真时钟：与 /joint_states 的仿真时间戳保持一致 -->
         <param name="use_sim_time" value="true" />
     </node>
 
     <include file="$(find-pkg-share ros_gz_sim)/launch/gz_sim.launch.py" >
-        <!-- <arg name="gz_args" value="empty.sdf -r" /> -->
-        <arg name="gz_args" value="$(find-pkg-share my_robot_bringup)/worlds/test_world.sdf -r" />
+        <arg name="gz_args" value="$(var gz_args)" />
     </include>
 
     <node pkg="ros_gz_sim" exec="create" args="-topic robot_description" />
