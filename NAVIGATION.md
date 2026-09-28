@@ -30,6 +30,11 @@ nav_status(IDLE/RUNNING/ARRIVED/FAILED + 当前位姿) <── nav_commander
 
 ## 使用步骤
 
+> **只想跑一遍完整 demo？** 见 [`DEMO.md`](DEMO.md)：一条命令
+> `ros2 launch my_robot_bringup demo_all.launch.py` 即可把下面 1~4 步
+> （含 Gazebo、导航、感知、机械臂命令节点、编排、发任务）全部串起来。
+> 下面保留分步方式，用于单模块调试。
+
 ### 1. 启动 Gazebo 仿真（含新激光雷达）
 ```bash
 cd ~/ros2_ws && colcon build --symlink-install
