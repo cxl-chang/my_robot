@@ -42,8 +42,15 @@ amcl:
     sigma_hit: 0.2
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.2
-    update_min_d: 0.25
+    # AMCL 的更新阈值：**只在移动超过这个量时才更新并发布 /amcl_pose**。
+    # 原来 0.25m / 0.2rad 太大 —— 抓取阶段全是 5~20cm 的小步移动，根本触发不了
+    # 更新，于是 /amcl_pose 长时间冻结。实测：Nav2 靠轮式里程计认为车在 (2.34,2.81)，
+    # 而 /amcl_pose 还停在 (2.11,2.79)（差 23cm，正好卡在 0.25 阈值内），
+    # 用陈旧位姿折算方块位置就会算出 x=0.696（实际 ~0.46），抓取连续失败。
+    # 0.10 而非 0.05：编排器已用"AMCL 快照 ⊕ 里程计增量"折算小步移动，
+    # 精度不再依赖 AMCL 的更新频率，放宽可省 CPU（机器负载本来就高）。
+    update_min_a: 0.10
+    update_min_d: 0.10
     z_hit: 0.5
     z_max: 0.05
     z_rand: 0.5
@@ -136,14 +143,28 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      # 【必须调小】判据是"在 movement_time_allowance 秒内移动 ≥ required_movement_radius"。
+      # 原来 0.5m / 10s 对抓取/放置这种小步移动是致命的：
+      #   ① "先退后进"的接近点只有 0.5m 远；
+      #   ② 抓取"自动补进"只有 0.1~0.3m；
+      #   ③ 原地对齐（RotateToGoal）根本不产生位移。
+      # 实测放置阶段：机器人要原地转约 170° 再走 0.16m，控制器又被 CPU 拖到 ~2Hz，
+      # 10 秒内位移不足 0.5m → "Failed to make progress" → BT 中止 → 导航失败
+      # （重试 8 次全都这样，最后 Goal failed）。
+      required_movement_radius: 0.10
+      movement_time_allowance: 30.0
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      # 到位精度权衡。
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      # 到位精度（**不要调大**，抓取/放置都靠它）：
+      #   原来 0.25 / 0.25 有个致命副作用——观测点→抓取点只前进 grasp_forward
+      #   = 0.175 m，比 xy 容差 0.25 m 还小！于是 Nav2 认为"已经在目标点上"，
+      #   直接报"导航成功到达目标"，机器人一步没走。实测抓取时方块落在 base 系
+      #   x≈0.78（应为 0.42），机械臂夹空，而 /red_cube_attach 仍把方块焊到夹爪上
+      #   → 表现为"机械臂离方块很远却显示已抓取"。
+      #   0.05 m / 0.05 rad 与 DWB 的 linear_granularity(0.05) 同量级，可收敛。
+      xy_goal_tolerance: 0.05
+      yaw_goal_tolerance: 0.05
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
@@ -168,7 +189,8 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.2
-      xy_goal_tolerance: 0.25
+      # 与 general_goal_checker 保持一致（这个决定 RotateToGoal 何时由平移切到原地转）
+      xy_goal_tolerance: 0.05
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
@@ -196,7 +218,15 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.05
-      robot_radius: 0.3
+      # 【真实 footprint，不要用 robot_radius】底盘 0.6x0.4，但**左右轮外沿到
+      # |y|=0.25**（轮心 ±0.225 + 轮宽 0.05），所以真实轮廓是 0.6x0.5：
+      #   内切半径 0.250（robot_radius=0.3 时被高估 5cm）
+      #   外接半径 0.3905（robot_radius=0.3 时被**低估 9cm**！）
+      # 低估外接半径的直接后果：Nav2 以为"贴着障碍原地转圈没事"（圆半径 0.3），
+      # 实际车角扫到 0.39 —— 实测在放置台旁边原地对齐时车角扫到台子支柱
+      # （停车点到支柱 0.36m）。改用矩形后 DWB 按真实四角做碰撞检查，
+      # 这类"转圈扫到东西"会被提前判成走不通，而不是靠物理碰撞才发现。
+      footprint: "[[-0.30, -0.25], [-0.30, 0.25], [0.30, 0.25], [0.30, -0.25]]"
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -235,7 +265,9 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_footlink
       use_sim_time: True
-      robot_radius: 0.3
+      # 与 local_costmap 保持一致：用真实矩形 footprint（0.6x0.5，含轮子外沿），
+      # 内切 0.250 / 外接 0.3905。详见 local_costmap 处的注释。
+      footprint: "[[-0.30, -0.25], [-0.30, 0.25], [0.30, 0.25], [0.30, -0.25]]"
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
