@@ -125,25 +125,33 @@ class ArucoDetector(Node):
         self.aruco_dict = cv2.aruco.Dictionary_get(ARUCO_DICT)
         self.aruco_params = cv2.aruco.DetectorParameters_create()
         # 周期统计（诊断：区分"收不到图像"/"检测不到"/"发布/M9 收不到"）
+        #
+        # 【两个计数必须分开】：
+        #   rx_count    —— 图像回调被调用的次数 = **真的收到图像**
+        #   frame_count —— **真正跑了检测**的次数（未使能、或被限频丢弃时都不加）
+        # 订阅自愈看门狗只能用 rx_count。识别暂停（/detection_enable=False）期间
+        # 图像仍在正常到达、只是在 image_cb 开头就被丢掉，用 frame_count 判会误报
+        # "连续 10s 未收到图像"并每 10s 重建一次订阅（纯日志噪声 + 无谓开销）。
+        self.rx_count = 0
         self.frame_count = 0
         self.detect_count = 0
-        self.no_frame_rounds = 0   # 连续无图像的统计轮数（用于订阅自愈）
+        self.no_frame_rounds = 0   # 连续"真没收到图像"的统计轮数（用于订阅自愈）
         self.create_timer(5.0, self.stats_cb)
         self.get_logger().info("ArUco detector 启动")
 
     def stats_cb(self):
         self.get_logger().info(
-            f'[统计] 近5s: 处理图像 {self.frame_count} 帧, '
-            f'丢弃 {self.skipped_count} 帧, '
+            f'[统计] 近5s: 收到图像 {self.rx_count} 帧'
+            f'（处理 {self.frame_count} / 丢弃 {self.skipped_count}）, '
             f'检测到标签 {self.detect_count} 次, '
             f'识别{"已开启" if self.enabled else "已暂停"}')
         self.skipped_count = 0
-        if self.frame_count == 0:
-            # 图像订阅失效（无图像 = 不检测 = 不发布），自动重建订阅自愈
+        if self.rx_count == 0:
+            # 图像订阅失效（回调根本不触发 = 真的没图像），自动重建订阅自愈
             self.no_frame_rounds += 1
             if self.no_frame_rounds >= 2:   # 连续 ~10s 无图像
                 self.get_logger().warn(
-                    '连续 10s 未收到图像，重建图像/内参订阅以自愈')
+                    '连续 10s 未收到任何图像，重建图像/内参订阅以自愈')
                 try:
                     self.destroy_subscription(self.image_sub)
                     self.destroy_subscription(self.caminfo_sub)
@@ -157,6 +165,7 @@ class ArucoDetector(Node):
                 self.no_frame_rounds = 0
         else:
             self.no_frame_rounds = 0
+        self.rx_count = 0
         self.frame_count = 0
         self.detect_count = 0
 
@@ -176,6 +185,9 @@ class ArucoDetector(Node):
             + f'（收到 {self.enable_topic}={self.enabled}）')
 
     def image_cb(self, msg: Image):
+        # 先记"收到图像"——注意要在所有丢弃分支之前，这样订阅自愈看门狗
+        # 才不会把"暂停期间正常到帧但被丢弃"误判成"没收到图像"。
+        self.rx_count += 1
         # 未使能：直接丢帧（连转换都不做）
         if not self.enabled:
             self.skipped_count += 1
