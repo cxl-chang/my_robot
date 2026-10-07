@@ -12,7 +12,7 @@ cd ~/ros2_ws && colcon build --symlink-install && source install/setup.bash
 
 ros2 launch my_robot_bringup demo_all.launch.py \
   obs_x:=2.2 obs_y:=3.0 obs_yaw:=-0.13 \
-  task_object_id:=red_cube place_x:=0.5 place_y:=0.5 place_yaw:=0.0
+  task_object_id:=red_cube place_x:=0.3 place_y:=4.5 place_yaw:=0.0
 ```
 
 这一条命令等价于原来的：
@@ -31,7 +31,8 @@ ros2 launch my_robot_bringup demo_all.launch.py \
 > 仿真抓取可靠性用）。若只想验证纯物理抓取或吸附插件出问题，把这两个参数
 > 一起设成 `false`。
 
-> 世界文件里的两张台子（取件台 + 放置台）台面高度都是 **0.40 m**，这是被机械臂
+> 取件台台面 **0.40 m**；放置台台面 **0.49 m**（比取件台高，是为了让机械臂底板
+> 顶面 0.42 m 能从台面下通过、车能贴到停车点 —— 见 `PICK_PLACE.md` 第六节），这是被机械臂
 > "可规划工作空间下限"倒逼出来的（自由规划最低约 z=0.45）。原因与实测数据见
 > [`PICK_PLACE.md`](PICK_PLACE.md) 第六节 —— 改场景时不要随意调低台面。
 
@@ -74,7 +75,7 @@ ros2 launch my_robot_bringup demo_all.launch.py \
 # A. 只起底盘 + 导航 + 感知，任务自己反复手发（调目标点时最常用）
 ros2 launch my_robot_bringup demo_all.launch.py auto_task:=false
 ros2 topic pub --once /task_cmd my_robot_interfaces/msg/TaskCommand \
-  "{object_id: 'red_cube', place_frame_id: 'map', place_x: 0.5, place_y: 0.5, place_yaw: 0.0}"
+  "{object_id: 'red_cube', place_frame_id: 'map', place_x: 0.3, place_y: 4.5, place_yaw: 0.0}"
 ros2 topic echo /task_status
 
 # B. 复用已经在跑的 Gazebo，只重启上层（省去每次重开仿真）
@@ -92,7 +93,7 @@ ros2 launch my_robot_bringup demo_all.launch.py use_arm:=false
 
 # F. 单独只发一次任务（不起其它任何东西）
 ros2 run my_robot_task_orchestrator task_sender --ros-args \
-  -p object_id:=red_cube -p place_x:=0.5 -p place_y:=0.5 -p delay:=0.0
+  -p object_id:=red_cube -p place_x:=0.3 -p place_y:=4.5 -p delay:=0.0
 ```
 
 ## 全部启动参数
@@ -124,12 +125,12 @@ ros2 run my_robot_task_orchestrator task_sender --ros-args \
 | `lift_z` | `0.70` | 抬起工具高度 |
 | `place_standoff` | `0.42` | 机器人在放置点前方多远停车 |
 | `place_approach_z` | `0.65` | 预放置工具高度 |
-| `place_down_z` | `0.50` | 下放工具高度（放置台面 0.40，指爪刚好贴面） |
+| `place_down_z` | `0.605` | 下放工具高度（放置台面顶 0.49；方块底面 = place_down_z−0.10）|
 | `attach_enabled` | `true` | 是否用 DetachableJoint 吸附 |
 | `use_detachable` | `true` | 是否给夹爪挂 DetachableJoint 插件（需与 `attach_enabled` 一致） |
 | `task_object_id` | `red_cube` | 要抓的物体类别 |
 | `place_frame_id` | `map` | 放置点坐标系 |
-| `place_x` / `place_y` | `0.5` / `0.5` | 放置点坐标 |
+| `place_x` / `place_y` | `0.3` / `4.5` | 放置点坐标。比台心(0.5)西 0.2m：车停在 x=−0.12，机械臂底板前伸只到 0.133m，够不到台面西沿(0.20)，机械臂完全不会蹭台；落点 x 余量 0.10m / y 余量 0.30m |
 | `place_yaw` | `0.0` | 放置点朝向（rad） |
 
 `task_sender` 自身的参数（`repeat`、`period`、`wait_for_subscriber`、
