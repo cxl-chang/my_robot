@@ -18,8 +18,13 @@
 //   即使是多线程执行器也会互相饿死 → plan() 卡死。
 //   所以 action server 挂在独立回调组，主函数用 MultiThreadedExecutor。
 
+#include <Eigen/Geometry>
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -48,6 +53,8 @@ using namespace std::placeholders;
 
 namespace {
 constexpr char kArmFrame[] = "base_footlink";  // 手臂位姿目标的参考系
+// 执行后"到位校验"允许的位置误差（米）。超过就判这次动作失败。
+constexpr double kAchieveTol = 0.005;  // 5mm
 }  // namespace
 
 class commander
@@ -149,6 +156,139 @@ public:
         return planAndExecute(arm, "arm -> joint target", err);
     }
 
+    /// 执行后校验：用 FK 算出末端实际位姿，与目标比位置误差，超阈值即判失败。
+    ///
+    /// 这是防止"规划/执行报成功、手臂却没到位"的最后一道闸门。
+    /// 为什么必须有它：MoveIt 的 setApproximateJointValueTarget() 会把
+    /// KinematicsQueryOptions.return_approximate_solution 置 true，IK 没收敛也
+    /// 把最接近的解当成功返回。实测：命令 tool_link 到 (0.42,0.078,0.60)，
+    /// 手臂实际停在 (0.343,0.034,0.734)（偏 14.4cm，Gazebo 物理位姿 + TF 双确认），
+    /// action 却报 success；紧接着的笛卡尔下压起点就离目标 0.25m（本该 0.10m），
+    /// 直线插补在最后一个点失败 → "笛卡尔路径只算到 97.96%"，整个抓取中止。
+    bool verifyAchieved(const geometry_msgs::msg::PoseStamped& target,
+                        std::string& err)
+    {
+        auto state = arm->getCurrentState(1.0);
+        if (!state)
+        {
+            RCLCPP_WARN(node_->get_logger(), "拿不到当前状态，跳过到位校验");
+            return true;
+        }
+        const Eigen::Isometry3d& got =
+            state->getGlobalLinkTransform(arm->getEndEffectorLink());
+        const Eigen::Vector3d want(target.pose.position.x,
+                                   target.pose.position.y,
+                                   target.pose.position.z);
+        const double d = (got.translation() - want).norm();
+        if (d > kAchieveTol)
+        {
+            err = "执行后末端位置误差 " + std::to_string(d * 1000.0) +
+                  " mm（阈值 " + std::to_string(kAchieveTol * 1000.0) +
+                  " mm）：手臂没到位";
+            RCLCPP_ERROR(node_->get_logger(), "%s", err.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    /// 位姿 → 关节角的**精确** IK，返回多组候选解（按"离当前构型由近到远"排序）。
+    ///
+    /// 为什么需要它（实测踩过的两个坑）：
+    ///  1) 不能用 setApproximateJointValueTarget()：它请求"近似解"
+    ///     （KinematicsQueryOptions.return_approximate_solution=true），IK 没收敛
+    ///     也报成功 → 命令 (0.42,0.078,0.60) 手臂停在 (0.343,0.034,0.734)，
+    ///     偏 14.4cm，随后笛卡尔下压起点离目标 0.25m → 最后一点插补失败。
+    ///  2) 也不能只信一组解：本臂对同一目标位姿有多组解。预抓取位姿
+    ///     (0.42,0.078,0.60) 有一组"基座 joint1≈-2.89 rad（转 166°）"的解，
+    ///     它离 carry 构型 4.55 rad，而该分支与当前构型之间没有无碰通路 →
+    ///     RRTConnect 20s 找不到路径 → MoveItErrorCode=99999，抓取直接失败；
+    ///     另一组紧凑解离 carry 只有 1.35 rad。
+    ///  所以这里用 当前状态 / SRDF 的 home / carry 三种子分别解 IK，去重后按
+    ///  关节空间距离排序返回，由调用方"由近到远逐个尝试规划"——近解优先（少动、
+    ///  且几乎总能规划出来），近解不行再退到远解，避免一次坏种子就判死整个任务。
+    std::vector<std::vector<double>> poseIkCandidates(
+        const geometry_msgs::msg::PoseStamped& target, std::string& err)
+    {
+        std::vector<std::vector<double>> out;
+        const auto model = arm->getRobotModel();
+        const moveit::core::JointModelGroup* jmg =
+            model ? model->getJointModelGroup(arm->getName()) : nullptr;
+        auto current = arm->getCurrentState(1.0);
+        if (jmg == nullptr || !current)
+        {
+            err = "拿不到关节模型或当前状态，无法做位姿 IK";
+            return out;
+        }
+        std::vector<double> q_now;
+        current->copyJointGroupPositions(jmg, q_now);
+        const std::string eef = arm->getEndEffectorLink();
+
+        std::vector<std::pair<double, std::vector<double>>> found;
+        for (const std::string nm : {"", "home", "carry"})
+        {
+            moveit::core::RobotState seed(*current);
+            if (!nm.empty() && !seed.setToDefaultValues(jmg, nm))
+            {
+                continue;  // SRDF 里没有这个命名状态
+            }
+            if (!seed.setFromIK(jmg, target.pose, eef, 0.2))
+            {
+                continue;
+            }
+            std::vector<double> q;
+            seed.copyJointGroupPositions(jmg, q);
+            double d2 = 0.0;
+            for (size_t i = 0; i < q_now.size() && i < q.size(); ++i)
+            {
+                const double dd = q_now[i] - q[i];
+                d2 += dd * dd;
+            }
+            // 去重：与已有候选差别很小就不重复加
+            bool dup = false;
+            for (const auto& f : found)
+            {
+                double e2 = 0.0;
+                for (size_t i = 0; i < f.second.size() && i < q.size(); ++i)
+                {
+                    const double dd = f.second[i] - q[i];
+                    e2 += dd * dd;
+                }
+                if (e2 < 1e-6)
+                {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup)
+            {
+                found.emplace_back(std::sqrt(d2), q);
+            }
+        }
+
+        std::sort(found.begin(), found.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& f : found)
+        {
+            out.push_back(f.second);
+        }
+        if (out.empty())
+        {
+            err = "位姿 IK 无解（精确解）：目标超出工作空间或姿态不可达";
+        }
+        else
+        {
+            std::string ds;
+            for (const auto& f : found)
+            {
+                ds += " " + std::to_string(f.first);
+            }
+            RCLCPP_INFO(node_->get_logger(),
+                        "位姿 IK 得到 %zu 组候选解，距当前构型(rad):%s",
+                        out.size(), ds.c_str());
+        }
+        return out;
+    }
+
     bool goPose(double x, double y, double z, double roll, double pitch,
                 double yaw, bool use_cartesian, std::string& err)
     {
@@ -177,18 +317,62 @@ public:
             // 整个规划预算（60s）甚至根本规划不出来；而**关节目标**是秒级完成的
             // （SRDF 里的 carry 等命名目标就是关节目标，一直是 ~1s）。
             //
-            // setApproximateJointValueTarget() 内部做一次 IK，并把结果当作
+            // setJointValueTarget(PoseStamped) 内部做一次**精确** IK，并把结果当作
             // JointValueTarget 交给规划器 —— 既保留"按位姿下指令"的接口语义，
             // 又让规划退化成关节空间问题。
-            if (arm->setApproximateJointValueTarget(target_pose))
+            //
+            // 【坑，切勿改回 setApproximateJointValueTarget()】
+            //  该接口把 KinematicsQueryOptions.return_approximate_solution 置 true：
+            //  IK 没收敛也把最接近的解当成功返回。实测命令 tool_link 到
+            //  (0.42,0.078,0.60)，手臂停在 (0.343,0.034,0.734)（偏 14.4cm）还报成功，
+            //  直接导致抓取时序里"预抓取"停在 z≈0.73，随后的笛卡尔下压起点离目标
+            //  0.25m（本该 0.10m）→ 直线插补最后一点失败 → 整个抓取中止。
+            //  注意 setJointValueTarget 即使失败也会把"部分结果"留在目标里，
+            //  所以失败必须立刻返回，不能再拿它去规划。
+            //
+            //  再补一层（关键）：位姿 → 关节角要"多组种子择优"。
+            //  本臂对同一目标位姿有多组解。实测预抓取位姿 (0.42,0.078,0.60) 会
+            //  被解到"基座 joint1≈-2.89 rad（转了 166°）"那一组，它离当前 carry
+            //  构型 4.55 rad；而该分支与当前构型之间没有无碰通路 → RRTConnect
+            //  20s 找不到路径 → MoveItErrorCode=99999，抓取直接失败。
+            //  另一组紧凑解（joint1≈+0.25）离 carry 只有 1.35 rad，规划秒过。
+            //  所以这里用当前状态 / SRDF 的 home / carry 三种子分别解 IK，
+            //  按"离当前构型由近到远"排序后**逐个尝试规划+执行+到位校验**：
+            //  近解优先（少动、且几乎总能规划出来），近解规划不出来再退到远解，
+            //  避免一次坏种子就判死整个抓取任务。
+            const auto candidates = poseIkCandidates(target_pose, err);
+            if (candidates.empty())
             {
-                return planAndExecute(arm, "arm -> pose(IK+关节目标)", err);
+                RCLCPP_ERROR(node_->get_logger(), "%s", err.c_str());
+                return false;
             }
-            // IK 未解出：回退为原来的位姿目标（会很慢，但至少不直接失败）
-            RCLCPP_WARN(node_->get_logger(),
-                        "位姿 IK 未解出，回退为原始位姿目标规划（可能很慢）");
-            arm->setPoseTarget(target_pose);
-            return planAndExecute(arm, "arm -> pose(自由规划)", err);
+            std::string last_err = err;
+            for (size_t i = 0; i < candidates.size(); ++i)
+            {
+                arm->setStartStateToCurrentState();
+                if (!arm->setJointValueTarget(candidates[i]))
+                {
+                    last_err = "第 " + std::to_string(i + 1) + " 组解设置失败";
+                    continue;
+                }
+                RCLCPP_INFO(node_->get_logger(), "尝试第 %zu/%zu 组 IK 解",
+                            i + 1, candidates.size());
+                std::string e;
+                if (!planAndExecute(arm, "arm -> pose(IK+关节目标)", e))
+                {
+                    last_err = e;
+                    continue;  // 这一组规划不出来，试下一组
+                }
+                if (verifyAchieved(target_pose, e))
+                {
+                    return true;
+                }
+                last_err = e;  // 到位校验没过，试下一组
+            }
+            err = "位姿目标 " + std::to_string(candidates.size()) +
+                  " 组 IK 解都失败，最后一条：" + last_err;
+            RCLCPP_ERROR(node_->get_logger(), "%s", err.c_str());
+            return false;
         }
 
         // 笛卡尔直线：抓取的竖直进给必须走这条路径。
@@ -214,7 +398,7 @@ public:
         RCLCPP_INFO(node_->get_logger(),
                     "笛卡尔路径完成度 %.1f%%，开始执行", fraction * 100.0);
         arm->execute(trajectory);
-        return true;
+        return verifyAchieved(target_pose, err);
     }
 
     // ================= action server =================
