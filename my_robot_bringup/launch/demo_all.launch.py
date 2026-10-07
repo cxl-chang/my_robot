@@ -5,12 +5,12 @@
 # 原来需要手敲 6 条命令，现在 1 条：
 #   ros2 launch my_robot_bringup demo_all.launch.py \
 #     obs_x:=2.2 obs_y:=3.0 obs_yaw:=-0.13 \
-#     task_object_id:=red_cube place_x:=0.5 place_y:=0.5 place_yaw:=0.0
+#     task_object_id:=red_cube place_x:=0.3 place_y:=4.5 place_yaw:=0.0
 #
 # 只起底盘+导航，任务手发（反复调试不同目标点时）：
 #   ros2 launch my_robot_bringup demo_all.launch.py auto_task:=false
 #   ros2 topic pub --once /task_cmd my_robot_interfaces/msg/TaskCommand \
-#     "{object_id: 'red_cube', place_frame_id: 'map', place_x: 0.5, place_y: 0.5, place_yaw: 0.0}"
+#     "{object_id: 'red_cube', place_frame_id: 'map', place_x: 0.3, place_y: 4.5, place_yaw: 0.0}"
 #
 # 复用已在运行的 Gazebo（只重启上层，省去每次重开仿真）：
 #   ros2 launch my_robot_bringup demo_all.launch.py use_gazebo:=false nav_delay:=1.0
@@ -73,6 +73,11 @@ def generate_launch_description():
     grasp_forward = LaunchConfiguration('grasp_forward')
     tool_x = LaunchConfiguration('tool_x')
     tool_y = LaunchConfiguration('tool_y')
+    object_x = LaunchConfiguration('object_x')
+    object_y = LaunchConfiguration('object_y')
+    grasp_tol = LaunchConfiguration('grasp_tol')
+    grasp_compensate_xy = LaunchConfiguration('grasp_compensate_xy')
+    grasp_auto = LaunchConfiguration('grasp_auto')
     pregrasp_z = LaunchConfiguration('pregrasp_z')
     grasp_z = LaunchConfiguration('grasp_z')
     lift_z = LaunchConfiguration('lift_z')
@@ -89,6 +94,8 @@ def generate_launch_description():
     place_x = LaunchConfiguration('place_x')
     place_y = LaunchConfiguration('place_y')
     place_yaw = LaunchConfiguration('place_yaw')
+    place_via = LaunchConfiguration('place_via')
+    place_via_dist = LaunchConfiguration('place_via_dist')
 
     declared_args = [
         # --- 开关 ---
@@ -169,6 +176,22 @@ def generate_launch_description():
             'tool_y', default_value='0.078',
             description='抓取时物体在 base_footlink 系的 y'),
         DeclareLaunchArgument(
+            'object_x', default_value='2.8',
+            description='方块世界 x（map 系）：抓取前用它校验机械臂够不够得到'),
+        DeclareLaunchArgument(
+            'object_y', default_value='3.0',
+            description='方块世界 y（map 系）：抓取前用它校验机械臂够不够得到'),
+        DeclareLaunchArgument(
+            'grasp_tol', default_value='0.03',
+            description='抓取点允许偏差 m，超过则判失败（防空抓+假吸附）'),
+        DeclareLaunchArgument(
+            'grasp_compensate_xy', default_value='0.30',
+            description='偏差在此范围内则直接改用实测方块位置当 IK 目标 m'),
+        DeclareLaunchArgument(
+            'grasp_auto', default_value='true',
+            description='按观测点实际距离自动标定前进距离（换观测点后不必手标 '
+                        'grasp_forward/tool_y；关掉则用固定值）'),
+        DeclareLaunchArgument(
             'pregrasp_z', default_value='0.60',
             description='预抓取工具高度（自由规划用，要高于可规划下限 ~0.45）'),
         DeclareLaunchArgument(
@@ -182,9 +205,9 @@ def generate_launch_description():
             'place_standoff', default_value='0.42',
             description='机器人在放置点前方多远停车'),
         DeclareLaunchArgument(
-            'place_approach_z', default_value='0.65', description='预放置工具高度'),
+            'place_approach_z', default_value='0.72', description='预放置工具高度'),
         DeclareLaunchArgument(
-            'place_down_z', default_value='0.495',
+            'place_down_z', default_value='0.605',
             description='下放工具高度（= 放置台面 0.40 + 0.095）。'
                         '注意：机械臂"可规划"的最低工具高度约 0.45，'
                         '比它的 IK 可达范围更严，别往低调'),
@@ -223,11 +246,17 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'place_frame_id', default_value='map', description='放置点坐标系'),
         DeclareLaunchArgument(
-            'place_x', default_value='0.5', description='放置点 x'),
+            'place_x', default_value='0.3', description='放置点 x'),
         DeclareLaunchArgument(
-            'place_y', default_value='0.5', description='放置点 y'),
+            'place_y', default_value='4.5', description='放置点 y'),
         DeclareLaunchArgument(
             'place_yaw', default_value='0.0', description='放置点朝向 rad'),
+        DeclareLaunchArgument(
+            'place_via', default_value='true',
+            description='放置前先退到停车点后方转好朝向（避免贴台子原地旋转）'),
+        DeclareLaunchArgument(
+            'place_via_dist', default_value='0.5',
+            description='"先退后进"的后退距离 m'),
     ]
 
     # ================= 1) Gazebo（t=0） =================
@@ -321,12 +350,19 @@ def generate_launch_description():
             'grasp_forward': grasp_forward,
             'tool_x': tool_x,
             'tool_y': tool_y,
+            'object_x': object_x,
+            'object_y': object_y,
+            'grasp_tol': grasp_tol,
+            'grasp_compensate_xy': grasp_compensate_xy,
+            'grasp_auto': grasp_auto,
             'pregrasp_z': pregrasp_z,
             'grasp_z': grasp_z,
             'lift_z': lift_z,
             'place_standoff': place_standoff,
             'place_approach_z': place_approach_z,
             'place_down_z': place_down_z,
+            'place_via': place_via,
+            'place_via_dist': place_via_dist,
             'attach_enabled': attach_enabled,
             'arm_timeout': arm_timeout,
         }])

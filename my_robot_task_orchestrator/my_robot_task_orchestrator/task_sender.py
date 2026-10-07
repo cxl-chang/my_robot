@@ -7,7 +7,14 @@
 参数
   object_id            要抓取的物体类别，默认 "red_cube"
   place_frame_id       放置点坐标系，默认 "map"
-  place_x / place_y    放置点平面坐标，默认 0.5 / 0.5
+  place_x / place_y    放置点平面坐标，默认 0.3 / 4.5
+                       （北侧空地。yaw=0 时机器人停在 (place_x-0.42, 4.5) 朝 +x。
+                         注意 place_x=0.3 比放置台中心（0.5）西 0.2m：车停在 x=-0.12，
+                         机械臂底板前伸只到 0.133m，而台面西沿在 0.15m —— 底板
+                         根本不会钻到台面下面，彻底避免"车贴太近、臂被台子蹭"。
+                         落点 (0.3,4.5) 在台面 (0.20~0.80) 内：x 方向余量 0.10m
+                         （只抵抗导航到位误差 ±5cm），y 方向余量 0.30m（朝向偏差
+                         造成的落点误差在 y 方向，靠这个余量兜住））
   place_yaw            放置点朝向 rad，默认 0.0
   delay                节点启动后再等多少秒才发，默认 2.0
   wait_for_subscriber  是否等 /task_cmd 出现订阅者（orchestrator 起来）再发，默认 True
@@ -30,8 +37,8 @@ class TaskSender(Node):
 
         self.declare_parameter('object_id', 'red_cube')
         self.declare_parameter('place_frame_id', 'map')
-        self.declare_parameter('place_x', 0.5)
-        self.declare_parameter('place_y', 0.5)
+        self.declare_parameter('place_x', 0.3)
+        self.declare_parameter('place_y', 4.5)
         self.declare_parameter('place_yaw', 0.0)
         self.declare_parameter('delay', 2.0)
         self.declare_parameter('wait_for_subscriber', True)
