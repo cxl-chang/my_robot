@@ -47,10 +47,21 @@ public:
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-    // 周期发布状态（含当前 map 系位姿），5 Hz
+    // 周期发布（5Hz）——只用来刷新"当前 map 系位姿"，**绝不重复播报终态**。
+    //
+    // 【踩过的坑】原来这里是 publishStatus() 直接重发 status_，而 status_ 是锁存的：
+    //   ARRIVED 会被每 200ms 重播一次。于是编排器刚发出下一个导航目标、stage 刚切到
+    //   NAV_GRASP，200ms 内就收到**上一个目标遗留的 ARRIVED** → 判定"已到位"并跳过
+    //   等待进入下一阶段。实测：发出抓取点目标 2ms 后就打印"已到位，进入 PICK"，
+    //   而机器人只走了 6cm（目标 0.5m 外），抓取随之失败。
+    //   终态只在 resultCallback 里播报一次；这里非 RUNNING 一律发 IDLE。
     timer_ = node_->create_wall_timer(
       std::chrono::milliseconds(200),
-      [this]() { publishStatus(); });
+      [this]() {
+        const int32_t s = (status_ == NavStatus::RUNNING) ? NavStatus::RUNNING
+                                                          : NavStatus::IDLE;
+        publishStatus(s);
+      });
 
     status_ = NavStatus::IDLE;
   }
@@ -156,6 +167,8 @@ private:
         status_ = NavStatus::FAILED;
         break;
     }
+    // 终态**只播报一次**（周期定时器不会再重发终态，见构造函数注释）
+    publishStatus(status_);
   }
 
   void publishStatus(int32_t forced_status = -1)
