@@ -254,13 +254,35 @@
       <self_collide>false</self_collide>
     </model>
         <model name='PlaceTable'>
+      <!-- 放置台：**薄台面 + 细支柱**，不再是实心方块。
+           为什么必须这样改：机械臂放置时手只能伸到 base 系 x=0.42，所以车必须停
+           在距台心 0.42m 处，此时车头到台子侧面只有 0.22m，而车体外接半径是
+           0.361m —— 实心方块（原来 0.4x0.4x0.4）会让车头必然插进去 0.14m，
+           实测把车顶得偏 0.19m、朝向偏 43°（Nav2 却仍报"导航成功到达"）。
+           改成台面在 z=0.37~0.40（高于底盘顶面 0.30）+ 0.12 见方支柱后，
+           车头可以正常钻到台面下方，停车点不再有碰撞。
+           注意：激光面在 z≈0.233，只会扫到支柱（0.12 见方），所以静态地图里的
+           占用补丁也应只画支柱那一小块，而不是整个台面投影（否则 NavFn 仍会
+           把停车点当禁区、让车提前停下）。 -->
       <static>true</static>
-      <pose>0.5 0.5 0.2 0 -0 0</pose>
+      <pose>0.5 4.5 0.2 0 -0 0</pose>
       <link name='place_table_link'>
-        <collision name='place_table_collision'>
+        <collision name='place_table_top_collision'>
+          <!-- 台面放大到 0.6x0.6（半宽 0.30）：放置阶段机器人朝向偏差十几度时，
+              释放点会被甩出台面边缘（实测 yaw+16.6° → 释放点偏北 0.12m，正好压边
+              掉出去）。半宽 0.30 后 ±0.30 的落点误差都能接住。
+              【台面高度 0.46~0.49，不是 0.37~0.40】机械臂底板
+              (0.28x0.28x0.12，装在 base_link(0.1133,0,0.2)) 顶面到**世界 z=0.42**，
+              前端伸到机器人中心前 0.253m。停车点在台心以西 0.42m(x=0.08) 时底板前端
+              到 x=0.333；台面若从 x=0.20 起、高度又只有 0.37~0.40 —— 就会
+              **x 重叠 133mm、z 重叠 30mm**，即底板实实在在插进台面。实测表现：
+              车被静态台面顶住，DWB 一边被推一边还要求 0.05 到位精度，反复转圈。
+              抬到 0.46 后底板净空 40mm。台面仍在激光面(0.233)之上，
+              2D 激光看不到 → 静态地图只需画支柱，改台面尺寸/高度都不用改地图。 -->
+          <pose>0 0 0.275 0 -0 0</pose>
           <geometry>
             <box>
-              <size>0.4 0.4 0.4</size>
+              <size>0.6 0.6 0.03</size>
             </box>
           </geometry>
           <surface>
@@ -274,15 +296,52 @@
             <contact/>
           </surface>
         </collision>
-        <visual name='place_table_visual'>
+        <collision name='place_table_pedestal_collision'>
+          <!-- 支柱**故意偏东**（局部 x=+0.10）：停车点在台心以西 0.42m 即世界
+               x=0.08，而车体旋转外接半径是 0.361m。支柱若居中(0.44~0.56)，停车点
+               到支柱侧面只有 0.36m —— Nav2 到点后原地对齐(RotateToGoal)时车角正好
+               扫到支柱（差 1mm），表现为"导航被放置台卡住"。东移后净空 0.46m，
+               留 10cm 余量；台面仍居中(0.30~0.70)，放置点(0.5,4.5)仍在台面正中。 -->
+          <pose>0.10 0 0.03 0 -0 0</pose>
           <geometry>
             <box>
-              <size>0.4 0.4 0.4</size>
+              <size>0.12 0.12 0.46</size>
+            </box>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>0.8</mu>
+                <mu2>0.8</mu2>
+              </ode>
+            </friction>
+            <bounce/>
+            <contact/>
+          </surface>
+        </collision>
+        <visual name='place_table_top_visual'>
+          <pose>0 0 0.275 0 -0 0</pose>
+          <geometry>
+            <box>
+              <size>0.6 0.6 0.03</size>
             </box>
           </geometry>
           <material>
             <ambient>0.25 0.25 0.32 1</ambient>
             <diffuse>0.45 0.45 0.55 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+        <visual name='place_table_pedestal_visual'>
+          <pose>0.10 0 0.03 0 -0 0</pose>
+          <geometry>
+            <box>
+              <size>0.12 0.12 0.46</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.18 0.18 0.24 1</ambient>
+            <diffuse>0.32 0.32 0.40 1</diffuse>
             <specular>0.1 0.1 0.1 1</specular>
           </material>
         </visual>
