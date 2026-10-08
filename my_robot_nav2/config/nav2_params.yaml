@@ -164,7 +164,7 @@ controller_server:
       #   → 表现为"机械臂离方块很远却显示已抓取"。
       #   0.05 m / 0.05 rad 与 DWB 的 linear_granularity(0.05) 同量级，可收敛。
       xy_goal_tolerance: 0.05
-      yaw_goal_tolerance: 0.05
+      yaw_goal_tolerance: 0.20
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
@@ -191,6 +191,7 @@ controller_server:
       transform_tolerance: 0.2
       # 与 general_goal_checker 保持一致（这个决定 RotateToGoal 何时由平移切到原地转）
       xy_goal_tolerance: 0.05
+      yaw_goal_tolerance: 0.20
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
