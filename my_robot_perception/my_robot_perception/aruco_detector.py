@@ -140,11 +140,19 @@ class ArucoDetector(Node):
         self.get_logger().info("ArUco detector 启动")
 
     def stats_cb(self):
-        self.get_logger().info(
-            f'[统计] 近5s: 收到图像 {self.rx_count} 帧'
-            f'（处理 {self.frame_count} / 丢弃 {self.skipped_count}）, '
-            f'检测到标签 {self.detect_count} 次, '
-            f'识别{"已开启" if self.enabled else "已暂停"}')
+        # 【只在"这一窗口确实有事发生"时才打印】
+        # 统计定时器是周期跑到底的，若无条件打印，任务结束后会永远每 5s 刷一行
+        # "收到图像 96 帧（处理 0 / 丢弃 96），识别已暂停" —— 纯噪声。
+        # 判定"有事"：处理过帧 / 检测到标签 / 识别开启中 / 或真的没图像（下面要告警）。
+        # 注意：下面的"订阅自愈"看门狗逻辑与日志分开，不受这里影响。
+        interesting = (self.rx_count == 0 or self.frame_count > 0
+                       or self.detect_count > 0 or self.enabled)
+        if interesting:
+            self.get_logger().info(
+                f'[统计] 近5s: 收到图像 {self.rx_count} 帧'
+                f'（处理 {self.frame_count} / 丢弃 {self.skipped_count}）, '
+                f'检测到标签 {self.detect_count} 次, '
+                f'识别{"已开启" if self.enabled else "已暂停"}')
         self.skipped_count = 0
         if self.rx_count == 0:
             # 图像订阅失效（回调根本不触发 = 真的没图像），自动重建订阅自愈
