@@ -189,7 +189,15 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.2
-      # 与 general_goal_checker 保持一致（这个决定 RotateToGoal 何时由平移切到原地转）
+      # ⚠ 下面这两个键 DWB **根本不读**（`strings libdwb_core.so` 里没有
+      #   xy_goal_tolerance 这个参数）——真正决定"何时由平移切到原地转"的是
+      #   RotateToGoal 判据**自己的** FollowPath.RotateToGoal.xy_goal_tolerance，
+      #   默认值 0.25 m。踩过的坑：它比 general_goal_checker 的 0.05 大 5 倍，
+      #   于是机器人离目标 25cm 处就停止平移、只做原地对齐；而本车转心在
+      #   base_footlink 后方 0.15m（驱动轮 x=-0.15），原地转会把这个控制点
+      #   推着走 0.15m → 永远满足不了 xy≤0.05 → **原地转圈死锁**
+      #   （实测：观测点前原地转了 270s，11 次 Failed to make progress，
+      #    任务卡在第一步导航上）。下面两个键留着只为可读性，改它们无效。
       xy_goal_tolerance: 0.05
       yaw_goal_tolerance: 0.20
       trans_stopped_velocity: 0.25
@@ -206,6 +214,9 @@ controller_server:
       RotateToGoal.scale: 32.0
       RotateToGoal.slowing_factor: 5.0
       RotateToGoal.lookahead_time: -1.0
+      # 【必须】必须与 general_goal_checker.xy_goal_tolerance 一致（=0.05），
+      # 否则就是上面注释里那个"原地转圈死锁"。
+      RotateToGoal.xy_goal_tolerance: 0.05
 
 local_costmap:
   local_costmap:
