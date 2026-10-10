@@ -164,7 +164,16 @@ controller_server:
       #   → 表现为"机械臂离方块很远却显示已抓取"。
       #   0.05 m / 0.05 rad 与 DWB 的 linear_granularity(0.05) 同量级，可收敛。
       xy_goal_tolerance: 0.05
-      yaw_goal_tolerance: 0.20
+      # yaw 容差为什么收回 0.10（曾一度放到 0.20 "减少旋转调整次数"）：
+      #   容差 0.20 rad 意味着允许带着 ±11° 的朝向误差判定到位。抓取前车头歪
+      #   11°，同一个方块在 base 系的位置就会被"转"出 0.42m×sin11°≈80mm，
+      #   到观测点(距方块 ~0.96m)更是 0.96m×sin11°≈180mm —— 两次测量能差出
+      #   288mm，直接顶爆机械臂 ±0.25m 的侧向范围（实测失败）。
+      #   当初放大容差是为了减少旋转调整，而旋转之所以难收敛是"转心与控制点
+      #   不重合"（已由 URDF 根坐标系移到转心解决），代价不必再付。
+      #   0.10 rad ≈ 5.7°，抓取点处横向误差 ≤42×sin5.7°≈42mm，够用。
+      #   若某处（如贴放置台）转不动了再考虑放宽到 0.15，不要超过 0.20。
+      yaw_goal_tolerance: 0.10
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
@@ -193,13 +202,14 @@ controller_server:
       #   xy_goal_tolerance 这个参数）——真正决定"何时由平移切到原地转"的是
       #   RotateToGoal 判据**自己的** FollowPath.RotateToGoal.xy_goal_tolerance，
       #   默认值 0.25 m。踩过的坑：它比 general_goal_checker 的 0.05 大 5 倍，
-      #   于是机器人离目标 25cm 处就停止平移、只做原地对齐；而本车转心在
-      #   base_footlink 后方 0.15m（驱动轮 x=-0.15），原地转会把这个控制点
-      #   推着走 0.15m → 永远满足不了 xy≤0.05 → **原地转圈死锁**
-      #   （实测：观测点前原地转了 270s，11 次 Failed to make progress，
-      #    任务卡在第一步导航上）。下面两个键留着只为可读性，改它们无效。
+      #   于是机器人离目标 25cm 处就停止平移、只做原地对齐；而当时本车转心在
+      #   控制点后方 0.15m，原地转会把这个控制点推着走 0.15m → 永远满足不了
+      #   xy≤0.05 → **原地转圈死锁**（实测：观测点前原地转了 270s，11 次
+      #   Failed to make progress，任务卡在第一步导航上）。转心问题已由 URDF
+      #   根坐标系移到轮轴解决，这里只需保证 xy 容差与 goal checker 一致。
+      #   下面两个键留着只为可读性，改它们无效（DWB 不读）。
       xy_goal_tolerance: 0.05
-      yaw_goal_tolerance: 0.20
+      yaw_goal_tolerance: 0.10
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
