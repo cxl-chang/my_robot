@@ -171,10 +171,10 @@ def generate_launch_description():
             description='观测点→抓取点沿朝向前进的距离 m（竖直下抓的可达范围限制）'),
         DeclareLaunchArgument(
             'tool_x', default_value='0.42',
-            description='抓取时物体在 base_footlink 系的 x'),
+            description='抓取时物体在 base_link 系的 x'),
         DeclareLaunchArgument(
             'tool_y', default_value='0.078',
-            description='抓取时物体在 base_footlink 系的 y'),
+            description='抓取时物体在 base_link 系的 y'),
         DeclareLaunchArgument(
             'object_x', default_value='2.8',
             description='方块世界 x（map 系）：抓取前用它校验机械臂够不够得到'),

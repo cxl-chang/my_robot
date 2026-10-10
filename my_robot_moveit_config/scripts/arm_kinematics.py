@@ -6,7 +6,7 @@
 SRDF 里的命名姿态（carry 搬运收起姿态）、以及固定点抓取用的 grasp/pregrasp
 关节角，都必须满足两个硬约束，靠"看着差不多"手填一定会踩坑：
 
-  1. **被抓物体要高于激光扫描平面**。lidar 装在 base_footlink 系
+  1. **被抓物体要高于激光扫描平面**。lidar 装在 base_link 系
      z = 0.1(base_joint) + 0.2/3*2 = 0.233 处。手臂抓着方块停在身前
      0.2~0.4m 高度时，2D 激光会把方块当成障碍物塞进 local costmap，
      Nav2 会直接卡死。所以 carry 姿态必须把方块抬到 z > 0.5。
@@ -32,7 +32,10 @@ from scipy.optimize import minimize
 
 ARM_JOINTS = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
 TOOL_LINK = 'tool_link'
-ROOT_LINK = 'base_footlink'
+# 机械臂几何（工具目标位姿、tool_x/tool_y 等标定值）都以 **base_link** 为基准。
+# 别再改回 base_footlink：URDF 里 base_footlink 是差速转心（轮轴中点），位于
+# base_link 后方 base_length/4=0.15m，拿它当根会让所有解在 x 方向偏 15cm。
+ROOT_LINK = 'base_link'
 
 
 # ----------------------------------------------------------------------
@@ -244,7 +247,7 @@ def main():
 
     if args.fk:
         p, R = kin.tool_pose(np.array(args.fk))
-        print(f'\ntool_link 位置 (base_footlink): {np.round(p, 4)}')
+        print(f'\ntool_link 位置 (base_link): {np.round(p, 4)}')
         print(f'tool_link 旋转矩阵:\n{np.round(R, 4)}')
         return 0
 
