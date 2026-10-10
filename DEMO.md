@@ -114,12 +114,13 @@ ros2 run my_robot_task_orchestrator task_sender --ros-args \
 | `use_initial_pose` | `true` | amcl 模式自动发 `/initialpose` |
 | `initial_x/y/yaw` | `0.0/0.0/0.0` | 初始位姿（map 系） |
 | `initial_delay` | `5.0` | amcl 启动后多久发初始位姿（s） |
-| `obs_x` / `obs_y` | `2.2` / `3.0` | 物体观测点（map 系） |
+| `obs_x` / `obs_y` | `1.84` / `2.82` | 物体观测点（map 系，指 **base_link** 要停的位置） |
 | `obs_yaw` | `-0.13` | 观测点朝向（rad） |
 | `obs_frame` | `map` | 观测点坐标系 |
+| `base_axle_offset` | `0.15` | 导航坐标系(base_footlink=差速转心)与 base_link 的 x 差；见下方"坐标系约定" |
 | `enable_pick` | `true` | 是否执行真实抓取（false = 退回旧占位行为，只导航） |
 | `grasp_forward` | `0.175` | 观测点→抓取点沿朝向前进距离（m） |
-| `tool_x` / `tool_y` | `0.42` / `0.078` | 抓取时物体在 base_footlink 系的位置 |
+| `tool_x` / `tool_y` | `0.42` / `0.078` | 抓取时物体在 base_link 系的位置（机械臂那一侧） |
 | `pregrasp_z` | `0.60` | 预抓取工具高度（必须 ≥ 0.45，见 `PICK_PLACE.md`） |
 | `grasp_z` | `0.50` | 抓取工具高度（由指爪长度定；指爪底端 = grasp_z − 0.10） |
 | `lift_z` | `0.70` | 抬起工具高度 |
@@ -136,6 +137,30 @@ ros2 run my_robot_task_orchestrator task_sender --ros-args \
 `task_sender` 自身的参数（`repeat`、`period`、`wait_for_subscriber`、
 `wait_timeout`、`delay`）见 `my_robot_task_orchestrator/my_robot_task_orchestrator/task_sender.py`
 的模块 docstring。
+
+### 坐标系约定（别再踩这个坑）
+
+驱动轮在 `base_link` 的 `x = -base_length/4 = -0.15`，**差速原地转的转心是轮轴中点**。
+URDF 把根坐标系 `base_footlink`（= Nav2 的 `robot_base_frame`）就放在轮轴中点上，
+于是它比 `base_link` 靠后 0.15 m：
+
+| 坐标系 | 谁在用 | 含义 |
+| --- | --- | --- |
+| `base_footlink` | Nav2 / AMCL / odom / `/amcl_pose` | 差速转心（轮轴中点）——原地转时它不动 |
+| `base_link` | 机械臂、相机、`tool_x/tool_y` 等标定值 | 机械臂基准 |
+
+若把 `base_footlink` 放回 `base_link` 正下方（老写法 `base_joint origin x=0`），
+一次"原地转"就会把 Nav2 的控制点沿半径 0.15 m 的圆推着走：到点对齐永远差 15 cm，
+控制器会在目标点反复"转↔平移"（实测放置接近点空转 78 s、转了 11 圈），
+抓取目标也系统性偏 15 cm，而且 odom（差速插件按"绕 base 帧积分"）与真实运动不符。
+
+编排器负责两个方向的换算（`base_axle_offset`，默认 0.15）：
+
+* 发导航目标前：`导航目标 = base_link目标 − 0.15·(cos yaw, sin yaw)`（`_to_nav_frame`）
+* 读 `/amcl_pose` 后：`base_link位姿 = 导航位姿 + 0.15·(cos yaw, sin yaw)`（`_to_base_link`）
+
+所以**所有已标定的观测点/放置点/工具位数值都不用改**。若哪天把 URDF 的 `base_joint`
+改回 `x=0`，记得把 `base_axle_offset` 设成 `0.0`。
 
 ## 启动自检清单
 

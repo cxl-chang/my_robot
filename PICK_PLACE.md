@@ -3,6 +3,13 @@
 本文记录"抓起识别到的物体并放到目的地"这条链路的实现进度、实测数据和坑。
 配套文档：`NAVIGATION.md`（导航栈）、`DEMO.md`（一键启动）。
 
+> **坐标系约定**：本文里的"base 系 / robot 系"一律指 **`base_link`** —— 机械臂和
+> 相机都装在它上面，`tool_x/tool_y`、可达区间、相机视场这些数字都是相对它量的。
+> 导航栈用的 `base_footlink`（= Nav2 `robot_base_frame`）是**差速转心（轮轴中点）**，
+> 在 `base_link` 后方 `base_length/4 = 0.15m`；两者由编排器的 `base_axle_offset`
+> 双向换算，所以观测点/放置点等已标定数值不受影响。详见 `DEMO.md` 的
+> "坐标系约定"一节。
+
 ---
 
 ## 一、M11 已完成的修复
@@ -187,7 +194,7 @@ MoveIt 参数，而 `ros2 run` 不传任何参数。
 ```
 task_type: named / pose / joint
 named  → group_name("arm"/"gripper") + named_target
-pose   → target_pose（base_footlink 系）+ use_cartesian
+pose   → target_pose（base_link 系）+ use_cartesian
 joint  → joint_values[6]
 ---
 result: success + message
@@ -208,8 +215,8 @@ feedback: phase + progress
 关节角由 `my_robot_moveit_config/scripts/arm_kinematics.py` 反解得到
 （位置误差 0.0mm / 姿态误差 0.00deg），工具位姿 `(0.30, 0, 0.80)`、工具 +Z 朝下。
 
-**为什么必须有**：lidar 扫描平面在 `base_footlink` 系
-`z = 0.1 + 0.2/3*2 = 0.233`。手臂抓着方块停在身前 0.2~0.4m 高度时，
+**为什么必须有**：lidar 扫描平面在 robot 系 `z = 0.1 + 0.2/3*2 = 0.233`
+（z 与 base_link / base_footlink 无关，两者只差平面上的 0.15m）。手臂抓着方块停在身前 0.2~0.4m 高度时，
 **2D 激光会把方块本身当成障碍物写进 local costmap**，Nav2 会直接卡死不动。
 `carry` 把被抓物体抬到 z≈0.74，且收在底盘正上方（x=0.30），
 既不挡激光也不超出 footprint。
@@ -219,7 +226,7 @@ feedback: phase + progress
 ## 二、实测可达性数据（M12/M13 的依据）
 
 用手臂 FK + 数值反解扫了一遍工作空间，工具姿态固定为"工具 +Z 朝下"
-（从上方竖直下抓的姿态）。参考系 `base_footlink`，坐标单位 m。
+（从上方竖直下抓的姿态）。参考系 `base_link`，坐标单位 m。
 
 ### 1. 竖直下抓时，前方够不到太远
 
@@ -256,7 +263,7 @@ feedback: phase + progress
 
 ### 3. 观测点与抓取点应该是两个点
 
-相机装在 `base_footlink` 系 `(0.305, 0, 0.2)`，`clip.near = 0.1`。
+相机装在 `base_link` 系 `(0.305, 0, 0.2)`，`clip.near = 0.1`。
 ArUco 标签贴在方块 **-X 面**（`test_world.sdf` 里 `aruco_bg` pose x=-0.027；
 `aruco_detector.py` 第 29 行注释写"+X 侧"是**错的**，代码逻辑不受影响）。
 
@@ -313,7 +320,7 @@ python3 my_robot_moveit_config/scripts/arm_kinematics.py --solve 0.42 0.078 0.28
 | M11 | 夹爪修复（两层根因）+ commander 能起来 + `/arm_task` action + `carry` | **已完成并验证** |
 | M12 | orchestrator 接上固定点抓取：观测点识别 → 前进到抓取点 → pregrasp → open → grasp(笛卡尔下压) → 闭合 → lift → carry | **已完成并端到端验证** |
 | M13 | 放置流程：导航到放置点 → preplace → 下放 → 松爪 → 退回（放置台已在世界文件里） | **已完成并端到端验证**；DetachableJoint 机制已验证（见第六节第 5 小节） |
-| M14 | 用 TF 把 `object_pose` 从 `camera_link_optical` 变到 `base_footlink`，动态算抓取点 | 待做 |
+| M14 | 用 TF 把 `object_pose` 从 `camera_link_optical` 变到 `base_link`，动态算抓取点 | 待做 |
 | M15 | 失败重试、多物体 id→class、吸附开关打磨 | 待做 |
 
 ---
@@ -504,7 +511,7 @@ PLACED → IDLE
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `grasp_forward` | 0.175 | 观测点→抓取点前进距离；前进后方块落到 base 系 (0.42, 0.078) |
-| `tool_x` / `tool_y` | 0.42 / 0.078 | 抓取时方块在 base_footlink 系的位置 |
+| `tool_x` / `tool_y` | 0.42 / 0.078 | 抓取时方块在 base_link 系的位置 |
 | `pregrasp_z` | 0.60 | 预抓取高度（自由规划，必须 ≥ 0.45） |
 | `grasp_z` | **0.50** | 抓取高度（笛卡尔下压终点）。由指爪长度定：指爪底端 = grasp_z − 0.10，台面 0.40 → 0.50 刚好贴面 |
 | `lift_z` | 0.70 | 抬起高度 |
@@ -548,7 +555,7 @@ ros2 run my_robot_task_orchestrator task_orchestrator
 
 #### 第一层：相机根本看不到标签（纯几何）
 
-相机装在 `base_footlink` 的 `(0.305, 0, 0.2)` 处且**水平朝前**，而取件台上方块的标签在
+相机装在 `base_link` 的 `(0.305, 0, 0.2)` 处且**水平朝前**，而取件台上方块的标签在
 `z ≈ 0.425`。把标签按真实位姿投影到图像平面：
 
 | 观测点 obs_x | 标签仰角 | 距标签(水平) | 标签 v 像素范围 | 结论 |
@@ -739,7 +746,7 @@ JointValueTarget 交给规划器。既保留"按位姿下指令"的接口语义�
 |---|---|
 | 真机/全栈联调 | 用真实的 Nav2 导航（不是假 ARRIVED）跑一遍完整 demo：`ros2 launch my_robot_bringup demo_all.launch.py` |
 | 吸附功能验证 | 桥接 `detachable_joint_state` 或 GUI 目视 |
-| M14 视觉闭环 | 用 TF 把 `/object_detection` 从 `camera_link_optical` 变到 `base_footlink`，动态算抓取点，替代当前的固定点 |
+| M14 视觉闭环 | 用 TF 把 `/object_detection` 从 `camera_link_optical` 变到 `base_link`，动态算抓取点，替代当前的固定点 |
 
 ### 7. 全栈真导航联调进展（截至本轮）
 
