@@ -77,7 +77,16 @@
     <joint name="base_joint" type="fixed">
         <parent link="base_footlink"/>
         <child link="base_link"/>
-        <origin xyz="0 0 ${wheel_radius}" rpy="0.0 0.0 0.0"/>
+        <!-- 【必须偏 base_length/4】驱动轮在 base_link 的 x=-base_length/4（见下面
+             两个轮子关节），差速原地转的转心就是轮轴中点；而导航栈的
+             robot_base_frame 用的正是 base_footlink。若把 base_footlink 放在
+             base_link 正下方，一次"原地转"就会把 Nav2 的控制点沿半径 0.15m 的
+             圆推着走：到点对齐永远差 15cm（实测放置接近点空转 78s、转了 11 圈），
+             抓取目标也随之系统性偏 15cm，而且 odom（差速插件按"绕 base 帧积分"）
+             与真实运动不符、AMCL 得一直纠。
+             把根坐标系移到轮轴中点后：原地转不再产生位移、odom 与物理一致，
+             机械臂/相机等 base_link 系几何全都不变。 -->
+        <origin xyz="${base_length/4.0} 0 ${wheel_radius}" rpy="0.0 0.0 0.0"/>
     </joint>
 
     <joint name="base_right_wheel_joint" type="continuous">
@@ -90,7 +99,7 @@
      <joint name="base_left_wheel_joint" type="continuous">
         <parent link="base_link"/>
         <child link="left_wheel_link"/>
-        <origin xyz="-0.15 0.225 0.0" rpy="0.0 0.0 0.0"/>
+        <origin xyz="${-base_length/4.0} 0.225 0.0" rpy="0.0 0.0 0.0"/>
         <axis xyz="0.0 1.0 0.0"/>
     </joint>
 
