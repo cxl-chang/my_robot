@@ -77,6 +77,13 @@ class TaskOrchestrator(Node):
         self.declare_parameter('obs_frame', 'map')
         # --- 识别与对准 ---
         self.declare_parameter('detect_timeout', 5.0)
+        # 导航栈坐标系与机械臂坐标系之间差多少（详见 _to_nav_frame/_to_base_link）：
+        # 驱动轮在 base_link 后方 base_length/4=0.15m，差速转心=轮轴中点，
+        # URDF 把根坐标系 base_footlink（= Nav2 的 robot_base_frame）放在转心上。
+        # 本节点里所有目标点/位姿换算都以 **base_link（机械臂那一侧）** 为准，
+        # 发给导航前减去这个偏移、从 /amcl_pose 读回后加回来。
+        # 若把 URDF 的 base_joint 改回 x=0，这里也要设成 0.0。
+        self.declare_parameter('base_axle_offset', 0.15)
         self.declare_parameter('max_retry', 10)
         self.declare_parameter('align_vel', 0.5)
         self.declare_parameter('rot_angle', 0.12)
@@ -161,6 +168,7 @@ class TaskOrchestrator(Node):
         self.obs_yaw = g('obs_yaw').value
         self.obs_frame = g('obs_frame').value
         self.detect_timeout = g('detect_timeout').value
+        self.base_axle_offset = g('base_axle_offset').value
         self.max_retry = g('max_retry').value
         self.align_vel = g('align_vel').value
         self.rot_angle = g('rot_angle').value
@@ -283,6 +291,7 @@ class TaskOrchestrator(Node):
             f'task_orchestrator 启动：观测点=({self.obs_x},{self.obs_y}) '
             f'yaw={self.obs_yaw} | 抓取前进 {self.grasp_forward}m | '
             f'抓取工具位 ({self.tool_x},{self.tool_y}) z={self.grasp_z} | '
+            f'转心偏移 {self.base_axle_offset:.2f}m（base_link↔导航坐标系）| '
             f'吸附={"开" if self.attach_enabled else "关"}')
 
     # ================= 状态发布 =================
@@ -326,19 +335,57 @@ class TaskOrchestrator(Node):
         self._nav_to_object()
 
     # ================= 导航 =================
+    def _to_nav_frame(self, x, y, yaw):
+        """base_link 目标 → 导航/AMCL 坐标系（轮轴中点）的目标。
+
+        本车驱动轮在 base_link 的 x=-base_length/4=-0.15，差速原地转的转心就是
+        轮轴中点，URDF 把根坐标系 base_footlink（= Nav2 的 robot_base_frame）
+        放在转心上（见 mobile_base.xacro 的 base_joint），所以：
+
+            p_base_link = p_base_footlink + R(yaw)·(offset, 0)
+
+        本节点里所有目标点（观测点、抓取点、放置接近点/停车点）说的都是
+        "机械臂那一侧"的位置，发给导航前要换算到 base_footlink，否则每个点
+        都会偏 0.15m（yaw=0 时偏在 x 上）。这样已标定的 obs_x/place_x 数值
+        一个都不用动。
+        """
+        if not self.base_axle_offset:
+            return float(x), float(y)
+        return (x - self.base_axle_offset * math.cos(yaw),
+                y - self.base_axle_offset * math.sin(yaw))
+
+    def _to_base_link(self, x, y, yaw):
+        """导航/AMCL 坐标系（轮轴中点）的位姿 → base_link 位姿（_to_nav_frame 逆）。
+
+        /amcl_pose 和 /odom 报的都是 base_footlink，而 _map_pose() 的语义是
+        "base_link 在 map 系的位姿"（下游 _object_in_base / 抓取校验都按 base_link
+        算机械臂够不够得到），所以这里统一加回偏移，下游不用改。
+        """
+        if not self.base_axle_offset:
+            return float(x), float(y), float(yaw)
+        return (x + self.base_axle_offset * math.cos(yaw),
+                y + self.base_axle_offset * math.sin(yaw), float(yaw))
+
     def _send_nav(self, x, y, yaw, frame, state, phase, stage):
+        gx, gy = self._to_nav_frame(x, y, yaw)
         g = NavGoal()
         g.frame_id = frame
-        g.x = float(x)
-        g.y = float(y)
+        g.x = float(gx)
+        g.y = float(gy)
         g.yaw = float(yaw)
-        self.nav_goal = (float(x), float(y))   # 用于校验"已到达"是否可信
+        self.nav_goal = (float(gx), float(gy))  # 用于校验"已到达"是否可信
         self._pub_status(state, phase)
         self.stage = stage
         self.stage_deadline = self._now() + rclpy.duration.Duration(
             seconds=self.nav_timeout)
-        self.get_logger().info(
-            f'{phase}：({g.x:.2f},{g.y:.2f}) yaw={g.yaw:.2f} frame={frame}')
+        if abs(gx - x) > 1e-9 or abs(gy - y) > 1e-9:
+            self.get_logger().info(
+                f'{phase}：base_link ({x:.2f},{y:.2f}) → 导航目标 '
+                f'({gx:.2f},{gy:.2f}) yaw={g.yaw:.2f} frame={frame}'
+                f'（差 {self.base_axle_offset:.2f}m 转心偏移）')
+        else:
+            self.get_logger().info(
+                f'{phase}：({gx:.2f},{gy:.2f}) yaw={g.yaw:.2f} frame={frame}')
         self.nav_pub.publish(g)
 
     def _nav_to_object(self):
@@ -478,12 +525,14 @@ class TaskOrchestrator(Node):
         if self.robot_pose is None:
             return None
         if self.amcl_snapshot is None or self.odom_pose is None:
-            return self.robot_pose
+            return self._to_base_link(*self.robot_pose)
         ax, ay, ath, ox, oy, oth = self.amcl_snapshot
         cx, cy, cth = self.odom_pose
         dx, dy, dth = cx - ox, cy - oy, cth - oth
         c, s = math.cos(ath), math.sin(ath)
-        return (ax + c * dx - s * dy, ay + s * dx + c * dy, ath + dth)
+        # 增量是"位移"，与参考点无关，直接叠加；最后统一换算成 base_link 位姿
+        return self._to_base_link(ax + c * dx - s * dy, ay + s * dx + c * dy,
+                                  ath + dth)
 
     # ================= 识别 =================
     def det_cb(self, msg: ObjectDetection):
