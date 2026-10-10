@@ -74,7 +74,7 @@ int main(int argc, char **argv)
 
     //=========================pose goal=========================
     geometry_msgs::msg::PoseStamped target_pose;
-    target_pose.header.frame_id = "base_footlink";
+    target_pose.header.frame_id = "base_link";  // 臂目标以 base_link 为参考系
     target_pose.pose.position.x = 0.843; //0.843, -0.235, 0.478
     target_pose.pose.position.y = -0.235;
     target_pose.pose.position.z = 0.478;

@@ -3,7 +3,7 @@
 // 两套接口并存：
 //
 //  1) 话题（原有，保留兼容，适合手动调试，fire-and-forget）
-//       /pose_cmd    my_robot_interfaces/PoseCommand   位姿目标（base_footlink 系）
+//       /pose_cmd    my_robot_interfaces/PoseCommand   位姿目标（base_link 系）
 //       /joint_cmd   Float64MultiArray[6]              关节目标 joint1..joint6
 //       /gripper_cmd example_interfaces/Bool           true=张开 false=闭合
 //
@@ -52,7 +52,11 @@ using GoalHandleArmTask = rclcpp_action::ServerGoalHandle<ArmTask>;
 using namespace std::placeholders;
 
 namespace {
-constexpr char kArmFrame[] = "base_footlink";  // 手臂位姿目标的参考系
+// 手臂位姿目标的参考系：**base_link**（机械臂/相机都装在这上面，tool_x/tool_y
+// 等标定值也都是相对它量的）。别改成 base_footlink：URDF 里 base_footlink 是
+// 差速转心（轮轴中点），在 base_link 后方 base_length/4=0.15m，用它当参考系
+// 会让每个臂目标整体偏 15cm。
+constexpr char kArmFrame[] = "base_link";
 // 执行后"到位校验"允许的位置误差（米）。超过就判这次动作失败。
 constexpr double kAchieveTol = 0.005;  // 5mm
 }  // namespace
