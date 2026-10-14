@@ -98,11 +98,20 @@ class TaskOrchestrator(Node):
         self.declare_parameter('grasp_forward', 0.175)   # 观测点→抓取点前进距离
         self.declare_parameter('tool_x', 0.42)           # 抓取时物体在 base 系 x
         self.declare_parameter('tool_y', 0.078)          # 抓取时物体在 base 系 y
-        self.declare_parameter('pregrasp_z', 0.60)
-        self.declare_parameter('grasp_z', 0.50)
+        # 取件台面 0.40 → 0.48（方块中心 0.505），抓取高度整体 +0.08：
+        # 原来的 0.50 比"竖直下抓自碰地板 0.52"还低 —— 手腕要擦过肩部，目标位姿
+        # 的所有 IK 解都自碰，笛卡尔直降只能算到 75~78%（停在 z≈0.522，指爪只
+        # 套进方块顶部 3cm，看起来像"碰到方块上方、够不到另一面"）。
+        # 抬到 0.58 后与放置高度 0.605 基本一致，抓/放共用一个已验证姿态区；
+        # 指爪与方块的相对关系不变（工具始终在方块中心上方 0.075）。
+        self.declare_parameter('pregrasp_z', 0.68)
+        self.declare_parameter('grasp_z', 0.58)
         self.declare_parameter('lift_z', 0.70)
         self.declare_parameter('carry_tool_x', 0.30)
-        self.declare_parameter('carry_tool_z', 0.80)
+        # 0.70 而不是 0.80：SRDF 里 carry 命名姿态的工具位姿就是 (0.30,0,0.70)，是标定过的
+        # 可行构型；(0.30,0,0.80) 求出的解 joint6 全落在 ±π 边界上，MoveIt 判越界 →
+        # 报"位姿 IK 无解"，收起搬运直接失败（实测）。
+        self.declare_parameter('carry_tool_z', 0.70)
         # 抓取可达性校验：固定点抓取默认"方块就在 (tool_x,tool_y)"，这个假设只在
         # 观测点/前进距离与方块实际位置匹配时成立。改过观测点却没重标定时，机械臂
         # 会夹空，而 /red_cube/attach 是无条件发的 → 方块被从原地焊到夹爪上，
@@ -122,11 +131,47 @@ class TaskOrchestrator(Node):
         # 会连带 carry 姿态/SRDF 命名目标/抓取放置 z 全部重标）。
         self.declare_parameter('grasp_auto', True)
         # 固定点竖直下抓的可靠区间（工具目标必须落在这里面才允许抓）
-        self.declare_parameter('grasp_reach_x_max', 0.50)
+        # x 上限 0.45 而不是 0.50：`PICK_PLACE.md` 那张"x≤0.50 都行"的表是在
+        # z=0.285 扫的（相对臂基座 3D 半径仅 0.40），而抓取在 z=0.50（半径
+        # 0.436），此时 joint3 的 +2.5 限位把半径卡在 ~0.45-0.46。实测方块落到
+        # base 系 x=0.465（到位残差 4cm 造成）时，下压直降的笛卡尔路径只算到
+        # 75% 就失败。留 1cm 余量取 0.45。
+        # 【窗口为什么要双向卡】竖直下抓时：
+        #   太近（x<0.42）：手臂要折起来才够得到 → 撞自己肩膀。实测 bx=0.384 时
+        #     FCL 报 shoulder_link <-> gripper_base_link 穿透 28.9mm，全部 IK 解无效。
+        #   太远（x>0.45）：joint3 顶限位，笛卡尔直降算不完（实测 75~78%）。
+        # 而导航到位残差本身就有 ±0.05m，和安全窗口宽度（0.42~0.45=3cm）同量级，
+        # 所以必须**到位后按实测闭环微调**，不能只靠一次导航。
+        self.declare_parameter('grasp_x_min', 0.42)
+        self.declare_parameter('grasp_x_mid', 0.435)   # 微调瞄准的中间值
+        # 导航总在目标前 ~0.045m 就判到位（xy_goal_tolerance=0.05），前后都一样，
+        # 所以"目标步长 = 期望位移 + 这个量"，否则微调会走不够。
+        self.declare_parameter('grasp_park_shortfall', 0.045)
+        self.declare_parameter('grasp_reach_x_max', 0.45)
         self.declare_parameter('grasp_reach_y', 0.25)
+        # grasp_auto=true 时抓取点由"方块 map 位置 + 目标朝向"反解；反解出来
+        # 离观测点超过这个距离就认为 object_x/object_y 参数不对，退回固定前进。
+        self.declare_parameter('grasp_auto_max_fwd', 1.2)
         # 方块超出可靠区间但只差一点点时，自动补走一小段再抓（视觉伺服式）
         self.declare_parameter('grasp_correct_max', 0.30)    # 单次最大补进量 m
         self.declare_parameter('grasp_correct_steps', 2)     # 最多补进几次
+        # 【必须】补进的最小步长：要补的距离若小于 Nav2 的 xy_goal_tolerance
+        # (0.05)，导航会认为"已经在目标点上"而一步不动（踩过）。而且导航总在
+        # 目标点前 ~0.05m 就判到位，所以"目标步长 ≈ 期望位移 + 0.05"：
+        # 取 0.12 ⇒ 实际大约走 0.07。宁可多走一点（落点偏近，机械臂低限 0.30
+        # 还远），也不要"发了目标却没动"。
+        # 微调的**目标步长下限**：小于导航的 xy_goal_tolerance(0.05) 时导航会判
+        # "已到位"一步不动；实际位移 ≈ 目标步长 − 0.045（到位短差）。取 0.06
+        # 而不是 0.12，避免过冲把方块推到窗口另一侧（踩过）。
+        self.declare_parameter('grasp_correct_min', 0.06)
+        # 微调**不用导航**，直接发 /cmd_vel 蠕动（/cmd_vel 经 gazebo_bridge 直连
+        # 底盘插件）。原因：导航走一次 BT+DWB 要好几秒，而这里往往只需要挪 2~5cm；
+        # 更要命的是导航总在目标前 ~0.045m 判到位，得靠"补偿"发更远的目标，
+        # 结果 2.5cm 的修正会变成一个 7cm 的导航任务（用户实测抱怨点）。
+        # 蠕动是开环按里程计推的，短距离精度足够，且位移精确等于需要值。
+        self.declare_parameter('creep_vel', 0.08)        # 蠕动线速度 m/s
+        self.declare_parameter('creep_settle', 0.8)      # 停稳等待 s
+        self.declare_parameter('creep_deadband', 0.005)  # 小于它就不动了 m
         # 收起搬运的目标**工具位姿**（不是关节目标）：工具抬到 0.80、收到底盘
         # 正上方 x=0.30，物体 z≈0.74 高于激光面。用笛卡尔直线走过去而不是
         # 用 SRDF 的 carry 关节目标 —— 实测采样规划到 carry 偶尔会耗光预算
@@ -183,6 +228,13 @@ class TaskOrchestrator(Node):
         self.pregrasp_z = g('pregrasp_z').value
         self.grasp_z = g('grasp_z').value
         self.lift_z = g('lift_z').value
+        # 护栏：抓取高度必须高于竖直下抓的自碰地板。注意这一句必须在上面两个
+        # 参数都赋值之后再写（第一版写在 grasp_z 赋值之前，直接把节点崩了）。
+        if self.grasp_z < 0.55:
+            self.get_logger().error(
+                f'grasp_z={self.grasp_z:.3f} 低于自碰地板 0.52 —— 手腕要擦过肩部，'
+                f'目标位姿的所有 IK 解都会自碰。取件台面 0.48/方块中心 0.505 ⇒ 应设 0.58。'
+                f'注意 demo_all.launch.py 的 grasp_z 会覆盖本节点默认值。')
         self.carry_tool_x = g('carry_tool_x').value
         self.carry_tool_z = g('carry_tool_z').value
         self.tool_rpy = (g('tool_roll').value, g('tool_pitch').value,
@@ -209,11 +261,22 @@ class TaskOrchestrator(Node):
         self.grasp_tol = g('grasp_tol').value   # 允许偏差（米），超过就判失败
         self.grasp_compensate_xy = g('grasp_compensate_xy').value  # 可选补偿窗口
         self.grasp_auto = bool(g('grasp_auto').value)
+        self.grasp_x_min = g('grasp_x_min').value
+        self.grasp_x_mid = g('grasp_x_mid').value
+        self.grasp_park_shortfall = g('grasp_park_shortfall').value
         self.grasp_reach_x_max = g('grasp_reach_x_max').value
         self.grasp_reach_y = g('grasp_reach_y').value
+        self.grasp_auto_max_fwd = g('grasp_auto_max_fwd').value
         self.grasp_correct_max = g('grasp_correct_max').value
         self.grasp_correct_steps = int(g('grasp_correct_steps').value)
+        self.grasp_correct_min = g('grasp_correct_min').value
+        self.creep_vel = g('creep_vel').value
+        self.creep_settle = g('creep_settle').value
+        self.creep_deadband = g('creep_deadband').value
         self.grasp_correct_count = 0
+        self.creep_start = None       # 微调蠕动开始时刻（None=不在蠕动）
+        self.creep_dist = 0.0         # 本次要走的距离（带符号）
+        self.creep_settle_until = None
 
         # 本次抓取实际用的工具目标（默认等于标定值，必要时被校验逻辑补偿）
         self.pick_tool_x = self.tool_x
@@ -393,27 +456,46 @@ class TaskOrchestrator(Node):
                        TaskStatus.NAV_TO_OBJECT, '导航到物体观测点', 'NAV_OBS')
 
     def _nav_to_grasp(self):
-        # 从观测点沿朝向再前进 grasp_forward 米（保持同一朝向）
+        """去抓取点：目标由**方块在 map 系的位置**直接反解，而不是在观测点上平移。
+
+        为什么不能用"观测点 + 前进 fwd"（旧写法）：`_object_in_base()` 给的是
+        方块在**当前朝向**下的 base 系坐标，它随车头朝向可变。观测点离方块 ~1m、
+        抓取点 ~0.4m，车头若两次差 20°（yaw_goal_tolerance 允许 ±11°），同一个
+        方块就会从 base 系 y=0.004 变成 y=0.292 —— 实测就是这样报"横向偏 288mm"
+        而失败的（0.96m × (sin10.6°+sin11.2°) ≈ 0.28m，与日志完全吻合）。
+
+        正确做法：要让方块落在 base 系 (tool_x, tool_y)，机器人 base_link 应停在
+            p_robot = p_object − R(obs_yaw)·(tool_x, tool_y)
+        这个式子只跟方块的世界位置和**目标朝向**有关，与到位时的实际朝向无关，
+        所以抓取点不会因为车头歪几度就飘掉；抓取校验里的 base 系偏差也就回到
+        "真实的到位位置误差"这一个来源。
+        """
         fwd = self.grasp_forward
-        # 自动标定：按"观测点实际离方块多远"决定前进距离，使得到抓取点时方块
-        # 正好落在 base 系 tool_x 处（前进只改变 base 系 x，y 不变）。
         if self.grasp_auto:
-            ob = self._object_in_base()
-            if ob is None:
+            c, s = math.cos(self.obs_yaw), math.sin(self.obs_yaw)
+            gx = self.object_x - (self.tool_x * c - self.tool_y * s)
+            gy = self.object_y - (self.tool_x * s + self.tool_y * c)
+            self.grasp_target_x = self.tool_x
+            self.grasp_target_y = self.tool_y
+            fwd = math.hypot(gx - self.obs_x, gy - self.obs_y)
+            if fwd > self.grasp_auto_max_fwd:
                 self.get_logger().warn(
-                    '还没收到 /amcl_pose，抓取前进距离用固定值 '
-                    f'{self.grasp_forward:.3f}（观测点改动过的话可能够不到方块）')
+                    f'由方块位置反解出的抓取点离观测点 {fwd:.2f}m'
+                    f'（上限 {self.grasp_auto_max_fwd:.2f}m）→ 方块参数 '
+                    f'object_x/object_y=({self.object_x},{self.object_y}) 可能不对，'
+                    f'退回固定前进 {self.grasp_forward:.3f}m')
+                fwd = self.grasp_forward
+                gx = self.obs_x + fwd * math.cos(self.obs_yaw)
+                gy = self.obs_y + fwd * math.sin(self.obs_yaw)
             else:
-                bx, by, _ = ob
-                fwd = max(0.0, min(bx - self.tool_x, 1.0))
-                self.grasp_target_x = self.tool_x
-                self.grasp_target_y = by
                 self.get_logger().info(
-                    f'自动标定：观测点处方块在 base 系 ({bx:.3f},{by:.3f}) → '
-                    f'前进 {fwd:.3f} m（固定值 {self.grasp_forward:.3f}），'
-                    f'抓取目标改为 ({self.grasp_target_x:.3f},{self.grasp_target_y:.3f})')
-        gx = self.obs_x + fwd * math.cos(self.obs_yaw)
-        gy = self.obs_y + fwd * math.sin(self.obs_yaw)
+                    f'抓取点由方块 ({self.object_x},{self.object_y}) 反解：'
+                    f'base_link 停在 ({gx:.2f},{gy:.2f})（离观测点 {fwd:.2f}m），'
+                    f'届时方块应落在 base 系 '
+                    f'({self.grasp_target_x:.3f},{self.grasp_target_y:.3f})')
+        else:
+            gx = self.obs_x + fwd * math.cos(self.obs_yaw)
+            gy = self.obs_y + fwd * math.sin(self.obs_yaw)
         self._send_nav(gx, gy, self.obs_yaw, self.obs_frame,
                        TaskStatus.NAV_TO_GRASP, '导航到抓取点', 'NAV_GRASP')
 
@@ -675,50 +757,56 @@ class TaskOrchestrator(Node):
                        f'{self.tool_y:.3f}，obs_yaw={psi:.3f}）'))
                 return 'fail'
 
-        # 最后一道：最终工具目标必须落在固定点竖直下抓的可靠区间内
-        # （否则 IK/规划会以各种奇怪方式失败，不如在这里明确拦下）
-        if not (0.30 <= self.pick_tool_x <= self.grasp_reach_x_max
+        # 最后一道：最终工具目标必须落在"竖直下抓安全窗口"内（见参数处注释）。
+        # 越界就前后微调一小段再来 —— 上界/下界是两个不同的物理原因
+        # （够不着 / 撞自己），窗口只有 3cm，必须双向闭环。
+        if not (self.grasp_x_min <= self.pick_tool_x <= self.grasp_reach_x_max
                 and abs(self.pick_tool_y) <= self.grasp_reach_y):
-            # 先看是不是"只是没走到位"（导航停早了/AMCL 与控制器口径差一点）：
-            # 这种情况下自动**补走一小段**再重新校验，而不是直接判死。
-            # 实测：目标 (2.37,2.82)，机器人停在 (2.26,2.84)（差 0.11m），
-            # 方块就落到 base 系 x=0.542 —— 超出 0.50 的可靠上限，但其实只差
-            # 12cm 车程。补进是"视觉伺服"里最自然的一步。
-            dx_need = bx - self.tool_x          # >0 表示还要往前
             if abs(by) > self.grasp_reach_y:
                 self._fail(
                     f'方块横向偏到 base 系 y={by:.3f}，超出机械臂可靠侧向范围 '
                     f'±{self.grasp_reach_y:.2f} m（机器人不能横移，只能靠手臂侧够）'
                     f'——观测点没正对方块，请调整 obs_x/obs_y 或 obs_yaw')
                 return 'fail'
-            if dx_need < 0:
-                # 不能靠倒车解决：controller 的 min_vel_x=0.0，Nav2 收到"后方目标"
-                # 会先原地掉头再开过去 —— 在贴着取件台的位置掉头很危险，直接失败。
-                self._fail(
-                    f'车停过头了：方块在 base 系 x={bx:.3f}，比目标 '
-                    f'{self.tool_x:.3f} 还近 {-dx_need * 1000:.0f} mm；'
-                    f'不自动倒车（会掉头），请把观测点/前进距离调小一点')
-                return 'fail'
-            if (dx_need <= self.grasp_correct_max
+            rx, ry, ryaw = pose
+            need = bx - self.grasp_x_mid          # >0 方块太远要往前，<0 太近要往后退
+            step = need + math.copysign(self.grasp_park_shortfall, need)
+            if abs(step) < self.grasp_correct_min:
+                step = math.copysign(self.grasp_correct_min, need)
+            if (abs(step) <= self.grasp_correct_max
                     and self.grasp_correct_count < self.grasp_correct_steps):
                 self.grasp_correct_count += 1
-                rx, ry, ryaw = pose
-                nx = rx + dx_need * math.cos(ryaw)
-                ny = ry + dx_need * math.sin(ryaw)
+                self.creep_dist = need          # 精确走这么多，不再加"到位短差补偿"
+                if abs(need) < self.creep_deadband:
+                    self.get_logger().info(
+                        f'方块在 base 系 x={bx:.3f}，与窗口中点 {self.grasp_x_mid:.3f} '
+                        f'只差 {need * 1000:+.1f} mm（< {self.creep_deadband * 1000:.0f} mm）'
+                        f'→ 不再微调，直接按实测位置抓')
+                    self.pick_tool_x, self.pick_tool_y = bx, by
+                    self.stage = 'PICK'
+                    self._run_ops(self._pick_ops(),
+                                  TaskStatus.PICKED, '抓取完成，准备搬运',
+                                  then=self._nav_to_place)
+                    return 'done'
+                self.creep_start = self._now()
+                self.creep_settle_until = None
+                self.stage = 'PICK_CREEP'
                 self.get_logger().warn(
-                    f'方块还在 base 系 x={bx:.3f}（可靠上限 '
-                    f'{self.grasp_reach_x_max:.2f}）→ 自动补走 '
-                    f'{dx_need * 1000:+.0f} mm 再抓（第 {self.grasp_correct_count}/'
-                    f'{self.grasp_correct_steps} 次）')
-                self._send_nav(nx, ny, ryaw, 'map', TaskStatus.NAV_TO_GRASP,
-                               '导航到抓取点（自动补进）', 'NAV_GRASP')
+                    f'方块在 base 系 x={bx:.3f}，安全窗口 '
+                    f'[{self.grasp_x_min:.2f},{self.grasp_reach_x_max:.2f}] → '
+                    f'直接蠕动{"前进" if need > 0 else "后退"} '
+                    f'{abs(need) * 1000:.0f} mm（{self.creep_vel} m/s，约 '
+                    f'{abs(need) / self.creep_vel:.1f}s，不走导航）'
+                    f'（第 {self.grasp_correct_count}/{self.grasp_correct_steps} 次）')
                 return 'retry'
             self._fail(
-                f'方块在 base 系 x={bx:.3f}，需要补走 {dx_need * 1000:.0f} mm，'
-                f'超过单次补进上限 {self.grasp_correct_max * 1000:.0f} mm'
-                f'（或已用完 {self.grasp_correct_steps} 次补进）——'
-                f'请检查观测点/前进距离与方块实际位置是否匹配')
+                f'方块在 base 系 x={bx:.3f}，安全窗口 '
+                f'[{self.grasp_x_min:.2f},{self.grasp_reach_x_max:.2f}]，'
+                f'需要{"前进" if need > 0 else "后退"} {abs(step) * 1000:.0f} mm，'
+                f'超出单次微调上限 {self.grasp_correct_max * 1000:.0f} mm'
+                f'（或已用完 {self.grasp_correct_steps} 次）')
             return 'fail'
+
         return 'ok'
 
     def _pick_ops(self):
@@ -741,29 +829,40 @@ class TaskOrchestrator(Node):
                           self._goal_pose(self.pick_tool_x, self.pick_tool_y,
                                           self.lift_z, True)),
             # 收起搬运：走**笛卡尔**到 carry 的工具位姿（确定性强于采样规划到 carry 关节目标）
-            self._op_goal('收起搬运',
-                          self._goal_pose(self.carry_tool_x, 0.0,
-                                          self.carry_tool_z, True)),
+            # 【必须用命名关节目标，不能发位姿】这个"收回身前"的位姿，其 IK 解
+            # 全部落在 joint6 = ±π 的边界上（SRDF carry 自己的 joint6=-3.1416 就
+            # 比限位 -π 还小 1e-5）⇒ MoveIt 的 IK 判越界 ⇒ 笛卡尔插补一步都算不
+            # 出来（实测 followed 0.000%、只有 1 个点）。而命名关节目标**不走 IK**，
+            # 规划器 20ms 就能到（日志里的 "arm -> carry 规划成功" 就是它）。
+            # 注意 carry_tool_z 保持与 SRDF carry 的工具高度一致（0.70），
+            # 否则位姿与命名目标就不是同一处了。
+            self._op_goal('收起搬运', self._goal_named('arm', 'carry')),
         ]
         return ops
 
     def _place_ops(self):
         ops = [
-            self._op_goal('预放置',
-                          self._goal_pose(self.place_standoff, 0.0,
-                                          self.place_approach_z, False)),
-            self._op_goal('下放',
-                          self._goal_pose(self.place_standoff, 0.0,
-                                          self.place_down_z, True)),
+            # 预放置走**标定关节目标**（SRDF: place_approach）——不经过 IK。
+            # 演进过程：①关节空间+孤立 IK → IK 只给出压限位/自碰的解；
+            # ②笛卡尔 → 插补在 joint6=±π 边界处断（88.9%）；③现在是标定关节目标：
+            # 离线用全局 IK 求出限位余量 0.578rad 的解写进 SRDF，运行时规划器直接
+            # 规划到该构型（跟 carry 一样 20ms 搞定），彻底没有 IK 收敛问题。
+            # 真正的根因是 KDL 的 setFromIK 会返回**未收敛的错解**（实测偏 180mm
+            # 仍报成功），commander 现已加 FK 自校验拦截这类解。
+            self._op_goal('预放置', self._goal_named('arm', 'place_approach')),
+            # 下放同样走**标定关节目标**（SRDF: place_down）。实测笛卡尔只能算到
+            # 96.2%（最后 1cm 的 IK 收敛不了，与 pre-place 同一类问题）。
+            # 这里用关节插值的代价：离线验过工具轨迹最多偏离直线 5.4mm（只在 x 向、
+            # y 恒为 0），对"把方块放到台面上"完全够用。
+            self._op_goal('下放', self._goal_named('arm', 'place_down')),
             self._op_goal('松开夹爪', self._goal_named('gripper', 'gripper_open')),
         ]
         if self.attach_enabled:
             ops.append(self._op_fn('脱开物体', self._do_detach))
             ops.append(self._op_wait('脱开稳定', self.attach_settle))
         ops += [
-            self._op_goal('退回',
-                          self._goal_pose(self.place_standoff, 0.0,
-                                          self.place_approach_z, True)),
+            # 退回 = 回到标定的预放置构型（已知良好、余量 0.578rad），同样不走 IK
+            self._op_goal('退回', self._goal_named('arm', 'place_approach')),
         ]
         return ops
 
@@ -904,6 +1003,30 @@ class TaskOrchestrator(Node):
                 return
             return
 
+        # --- 抓取点微调（直接蠕动，不走导航）---
+        if self.stage == 'PICK_CREEP':
+            if self.creep_start is not None:
+                elapsed = (now - self.creep_start).nanoseconds / 1e9
+                dur = abs(self.creep_dist) / max(self.creep_vel, 1e-3)
+                if elapsed >= dur:
+                    self.cmd_vel_pub.publish(Twist())       # 停
+                    self.creep_start = None
+                    self.creep_settle_until = now + rclpy.duration.Duration(
+                        seconds=self.creep_settle)
+                    self.get_logger().info(
+                        f'微调蠕动完成（目标 {self.creep_dist * 1000:+.0f} mm，'
+                        f'用时 {elapsed:.1f}s），稳定后重新校验')
+                else:
+                    t = Twist()
+                    t.linear.x = math.copysign(self.creep_vel, self.creep_dist)
+                    self.cmd_vel_pub.publish(t)
+            elif self.creep_settle_until is not None and now >= self.creep_settle_until:
+                self.creep_settle_until = None
+                self.stage = 'SETTLE'        # 回到"稳定 → 重新校验"的循环
+                self.settle_start = now
+                self.settle_next = 'PICK'
+            return
+
         # --- 稳定等待 ---
         if self.stage == 'SETTLE':
             if self.settle_start is not None and \
@@ -920,7 +1043,9 @@ class TaskOrchestrator(Node):
                     if verdict == 'fail':
                         return          # 校验内部已 _fail，别再去空抓
                     if verdict == 'retry':
-                        return          # 已发出"补进"目标，等它到位后重新校验
+                        return          # 已进入微调（蠕动）或已发导航，稍后重新校验
+                    if verdict == 'done':
+                        return          # 偏差极小，已直接开始抓取序列
                     self.stage = 'PICK'
                     self._run_ops(self._pick_ops(),
                                   TaskStatus.PICKED, '抓取完成，准备搬运',
@@ -1003,6 +1128,9 @@ class TaskOrchestrator(Node):
 
     # ================= 收尾 =================
     def _task_done(self):
+        self.cmd_vel_pub.publish(Twist())      # 收尾同样清零底盘
+        self.creep_start = None
+        self.creep_settle_until = None
         self._set_detect(False, '任务结束')
         self._pub_status(TaskStatus.IDLE, '任务完成')
         self.stage = 'IDLE'
@@ -1011,6 +1139,11 @@ class TaskOrchestrator(Node):
 
     def _fail(self, reason):
         self._cancel_arm()
+        # 【安全】必须先停底盘：蠕动微调是按 /cmd_vel 开环发的，而底盘插件会
+        # 一直保持最后一条指令 —— 不在失败路径上清零，车会带着 0.08m/s 一直走。
+        self.cmd_vel_pub.publish(Twist())
+        self.creep_start = None
+        self.creep_settle_until = None
         self.ops = None
         self.op_kind = None
         self.get_logger().error(f'任务失败：{reason}')
