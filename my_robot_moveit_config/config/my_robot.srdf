@@ -164,4 +164,28 @@
     <disable_collisions link1="lidar_link" link2="right_wheel_link" reason="Never"/>
     <disable_collisions link1="lidar_link" link2="shoulder_link" reason="Never"/>
     <disable_collisions link1="right_wheel_link" link2="shoulder_link" reason="Never"/>
+    <!-- 放置位姿的**标定关节目标**（离线全局 IK 求得，关节限位余量 0.578 rad）。
+         为什么要标定：这两位姿的 IK 在 KDL 里会返回未收敛的错解
+         （实测偏 180mm 却报成功），笛卡尔插补也因此在中途断掉。
+         走命名关节目标就不经过 IK，与 carry 同一套办法。 -->
+    <group_state name="place_approach" group="arm">
+        <joint name="joint1" value="0.000020"/>
+        <joint name="joint2" value="-0.578185"/>
+        <joint name="joint3" value="-0.071982"/>
+        <joint name="joint4" value="-0.000032"/>
+        <joint name="joint5" value="0.991802"/>
+        <joint name="joint6" value="-3.141539"/>
+    </group_state>
+    <!-- 放置位姿的**标定关节目标**（离线全局 IK 求得，关节限位余量 0.887 rad）。
+         为什么要标定：这两位姿的 IK 在 KDL 里会返回未收敛的错解
+         （实测偏 180mm 却报成功），笛卡尔插补也因此在中途断掉。
+         走命名关节目标就不经过 IK，与 carry 同一套办法。 -->
+    <group_state name="place_down" group="arm">
+        <joint name="joint1" value="0.000069"/>
+        <joint name="joint2" value="-0.287024"/>
+        <joint name="joint3" value="0.014266"/>
+        <joint name="joint4" value="-0.000182"/>
+        <joint name="joint5" value="0.614338"/>
+        <joint name="joint6" value="-3.141356"/>
+    </group_state>
 </robot>

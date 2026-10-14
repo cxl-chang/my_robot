@@ -4,8 +4,10 @@ arm:
   # 原来是 Setup Assistant 的默认 0.005s（5ms）。KDL 在 5ms 内基本搜不出解，
   # 抓取时会频繁报"找不到 IK"。抓取坐标偏差几十毫米就需要规划器多试几次，
   # 所以这里放宽到 50ms 并允许多次尝试。
-  kinematics_solver_timeout: 0.050000000000000003
-  kinematics_solver_attempts: 5
+  # 0.05s/5 次对"贴身、工具朝下"这类位姿远远不够（实测 KDL 会返回
+  # 未收敛的解，FK 校验差 180mm）。放宽到 0.2s/20 次。
+  kinematics_solver_timeout: 0.2
+  kinematics_solver_attempts: 20
 # gripper 组是关节组（含 1 个 fixed + 2 个 prismatic 关节），不是运动链，
 # 给它配 KDL 求解器只会在启动时刷
 #   "Group 'gripper' is not a chain ... Kinematics solver could not be instantiated"
