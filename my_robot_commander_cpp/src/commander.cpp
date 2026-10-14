@@ -34,6 +34,8 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <moveit_msgs/srv/get_state_validity.hpp>
+#include <random>
 #include <example_interfaces/msg/bool.hpp>
 #include <example_interfaces/msg/float64_multi_array.hpp>
 #include <geometry_msgs/msg/pose.hpp>
@@ -81,6 +83,8 @@ public:
         plan_time_cap_ = node_->get_parameter("plan_time_cap").as_double();
 
         arm = std::make_shared<MoveGroupInterface>(node_, "arm");
+        validity_cli_ = node_->create_client<moveit_msgs::srv::GetStateValidity>(
+            "check_state_validity");
         arm->setMaxAccelerationScalingFactor(1.0);
         arm->setMaxVelocityScalingFactor(1.0);
         arm->setPlanningTime(10.0);
@@ -210,6 +214,66 @@ public:
     ///  所以这里用 当前状态 / SRDF 的 home / carry 三种子分别解 IK，去重后按
     ///  关节空间距离排序返回，由调用方"由近到远逐个尝试规划"——近解优先（少动、
     ///  且几乎总能规划出来），近解不行再退到远解，避免一次坏种子就判死整个任务。
+    /// 用 move_group 的 /check_state_validity 校验一组关节值：
+    /// 1=有效，0=自碰或越界，-1=服务不可用。
+    int checkStateValidity(const moveit::core::JointModelGroup* jmg,
+                           const std::vector<double>& q)
+    {
+        if (!validity_cli_ || !validity_cli_->service_is_ready())
+        {
+            return -1;
+        }
+        auto req = std::make_shared<moveit_msgs::srv::GetStateValidity::Request>();
+        req->group_name = arm->getName();
+        req->robot_state.joint_state.name = jmg->getActiveJointModelNames();
+        req->robot_state.joint_state.position = q;
+        auto fut = validity_cli_->async_send_request(req);
+        if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready)
+        {
+            RCLCPP_WARN(node_->get_logger(), "check_state_validity 超时");
+            return -1;
+        }
+        auto resp = fut.get();
+        if (!resp->valid)
+        {
+            last_invalid_reason_ = "无接触信息";
+            // 把被剔除的构型也打出来：离线复现这组关节角就能算出到底是哪两个零件
+            // 在什么位置接触（我们用自己的几何算出来是 120mm 余量，和 FCL 不一致，
+            // 有这组关节值才能查清）。
+            if (invalid_log_count_ < 6)
+            {
+                std::string qs;
+                for (double v : q) { qs += " " + std::to_string(v); }
+                RCLCPP_WARN(node_->get_logger(),
+                            "剔除构型：joints=[%s ]", qs.c_str());
+                ++invalid_log_count_;
+            }
+            if (!resp->contacts.empty())
+            {
+                const auto& c = resp->contacts.front();
+                char buf[192];
+                std::snprintf(buf, sizeof(buf), "%s <-> %s depth %.1fmm",
+                              c.contact_body_1.c_str(), c.contact_body_2.c_str(),
+                              c.depth * 1000.0);
+                last_invalid_reason_ = buf;
+            }
+        }
+        return resp->valid ? 1 : 0;
+    }
+
+    /// 位姿 IK，返回多组**可用**候选解（按离当前构型由近到远排序）。
+    ///
+    /// 三个坑（都实测踩过）：
+    ///  1) 不能用 setApproximateJointValueTarget()：近似解，IK 没收敛也报成功；
+    ///  2) 不能只信一组解：同一目标有多组解，其中"基座 joint1≈±pi"那族离当前构型
+    ///     很远、中间没有无碰通路 -> RRTConnect 找不到路径（99999）；
+    ///  3) **IK 不查碰撞**：解出来的构型可能撞自己。实测取放置位姿时 IK 只给一组解
+    ///     （joint6 恰好压在 -pi 限位上），FCL 报
+    ///       Found a contact between 'shoulder_link' and 'gripper_base_link'
+    ///     -> RRTConnect "Unable to sample any valid states for goal tree"
+    ///     -> 30ms Catastrophic failure。
+    /// 所以：多种子解 IK -> 去重 -> 排序 -> **逐个过 /check_state_validity**，
+    /// 只把能用的交给调用方；一轮全废就换更多随机种子 + 更长超时再试一轮。
     std::vector<std::vector<double>> poseIkCandidates(
         const geometry_msgs::msg::PoseStamped& target, std::string& err)
     {
@@ -226,70 +290,154 @@ public:
         std::vector<double> q_now;
         current->copyJointGroupPositions(jmg, q_now);
         const std::string eef = arm->getEndEffectorLink();
-
         std::vector<std::pair<double, std::vector<double>>> found;
-        for (const std::string nm : {"", "home", "carry"})
-        {
-            moveit::core::RobotState seed(*current);
-            if (!nm.empty() && !seed.setToDefaultValues(jmg, nm))
+
+        auto collect = [&](int n_random, double timeout, unsigned seed) {
+            std::vector<std::vector<double>> seeds;
+            seeds.push_back(q_now);
+            // 种子要够杂：本臂同一目标有多族解，而"贴身、工具朝下"的位姿里，
+            // 有些族的 joint6 正好压在 ±pi 边界上（IK 在边界处解不出来）。
+            // SRDF 里所有命名状态都拿来当种子，加上随机种子，才有机会找到
+            // joint6≈0 那族（它才既不自碰、又不在限位上）。
+            for (const std::string nm : {"home", "carry", "pose_1", "pose_2"})
             {
-                continue;  // SRDF 里没有这个命名状态
+                moveit::core::RobotState sd(*current);
+                if (sd.setToDefaultValues(jmg, nm))
+                {
+                    std::vector<double> q;
+                    sd.copyJointGroupPositions(jmg, q);
+                    seeds.push_back(q);
+                }
             }
-            if (!seed.setFromIK(jmg, target.pose, eef, 0.2))
+            std::mt19937 rng(seed);
+            for (int k = 0; k < n_random; ++k)
             {
-                continue;
+                moveit::core::RobotState sd(*current);
+                sd.setToRandomPositions(jmg);
+                std::vector<double> q;
+                sd.copyJointGroupPositions(jmg, q);
+                seeds.push_back(q);
             }
-            std::vector<double> q;
-            seed.copyJointGroupPositions(jmg, q);
-            double d2 = 0.0;
-            for (size_t i = 0; i < q_now.size() && i < q.size(); ++i)
+            for (const auto& seed_q : seeds)
             {
-                const double dd = q_now[i] - q[i];
-                d2 += dd * dd;
+                moveit::core::RobotState sd(*current);
+                sd.setJointGroupPositions(jmg, seed_q);
+                if (!sd.setFromIK(jmg, target.pose, eef, timeout))
+                {
+                    continue;
+                }
+                std::vector<double> q;
+                sd.copyJointGroupPositions(jmg, q);
+                // 【必须做】FK 自校验：KDL 是局部迭代，没收敛时会把"种子附近的
+                // 部分迭代结果"当成功返回。实测取预放置位姿时返回的解做正解
+                // 得到 (0.270,0,0.620)，而目标是 (0.420,0,0.720) —— 差了 180mm，
+                // 却被 setFromIK 报成成功；后面的 /check_state_validity 又拿这组
+                // 垃圾去查自碰，于是报出误导性的"全部自碰"。
+                // 这里用同一次 IK 的 FK 结果反查，误差超过 1mm 就丢掉。
+                {
+                    moveit::core::RobotState chk(sd);
+                    chk.setJointGroupPositions(jmg, q);
+                    chk.update();
+                    const Eigen::Vector3d got =
+                        chk.getGlobalLinkTransform(eef).translation();
+                    const Eigen::Vector3d want(target.pose.position.x,
+                                               target.pose.position.y,
+                                               target.pose.position.z);
+                    const double perr = (got - want).norm();
+                    if (perr > 1e-3)
+                    {
+                        ++ik_unconverged_;
+                        if (ik_unconverged_ <= 3)
+                        {
+                            RCLCPP_WARN(node_->get_logger(),
+                                        "丢弃未收敛的 IK 解：FK 位置误差 %.1f mm"
+                                        "（求解器报成功，但解是错的）", perr * 1000.0);
+                        }
+                        continue;
+                    }
+                }
+                double d2 = 0.0;
+                for (size_t i = 0; i < q_now.size() && i < q.size(); ++i)
+                {
+                    const double dd = q_now[i] - q[i];
+                    d2 += dd * dd;
+                }
+                bool dup = false;
+                for (const auto& f : found)
+                {
+                    double e2 = 0.0;
+                    for (size_t i = 0; i < f.second.size() && i < q.size(); ++i)
+                    {
+                        const double dd = f.second[i] - q[i];
+                        e2 += dd * dd;
+                    }
+                    if (e2 < 1e-6) { dup = true; break; }
+                }
+                if (!dup) { found.emplace_back(std::sqrt(d2), q); }
             }
-            // 去重：与已有候选差别很小就不重复加
-            bool dup = false;
+        };
+
+        auto filter = [&](size_t& rejected) {
+            std::vector<std::pair<double, std::vector<double>>> keep;
             for (const auto& f : found)
             {
-                double e2 = 0.0;
-                for (size_t i = 0; i < f.second.size() && i < q.size(); ++i)
+                const int v = checkStateValidity(jmg, f.second);
+                if (v < 0)
                 {
-                    const double dd = f.second[i] - q[i];
-                    e2 += dd * dd;
+                    keep = found;      // 服务不可用：不做过滤
+                    return -1;
                 }
-                if (e2 < 1e-6)
-                {
-                    dup = true;
-                    break;
-                }
+                if (v == 0) { ++rejected; continue; }
+                keep.push_back(f);
             }
-            if (!dup)
+            found = keep;
+            return 0;
+        };
+
+        collect(20, 0.5, 20261010u);
+        size_t rejected = 0;
+        if (filter(rejected) == -1)
+        {
+            RCLCPP_WARN(node_->get_logger(),
+                        "拿不到 /check_state_validity，跳过自碰校验");
+        }
+        if (found.empty() && rejected > 0)
+        {
+            RCLCPP_WARN(node_->get_logger(),
+                        "位姿 IK 第一轮 %zu 组解全部自碰/越界（最近原因：%s），"
+                        "换 24 个随机种子 + 1.0s 超时再试",
+                        rejected, last_invalid_reason_.c_str());
+            rejected = 0;
+            collect(24, 2.0, 97531u);
+            if (filter(rejected) == -1)
             {
-                found.emplace_back(std::sqrt(d2), q);
+                RCLCPP_WARN(node_->get_logger(),
+                            "拿不到 /check_state_validity，跳过自碰校验");
             }
         }
-
+        if (found.empty())
+        {
+            err = rejected > 0
+                      ? "位姿 IK 的解全部自碰/越界（最近原因：" + last_invalid_reason_ +
+                        "）——该目标在当前位形下只有撞自己的构型"
+                      : (ik_unconverged_ > 0
+                             ? "位姿 IK 无解：求解器给的解都没收敛（FK 校验不过），"
+                               "需要换 IK 求解器或放宽目标"
+                             : "位姿 IK 无解（精确解）：目标超出工作空间或姿态不可达");
+            RCLCPP_ERROR(node_->get_logger(), "%s", err.c_str());
+            return out;
+        }
         std::sort(found.begin(), found.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::string ds;
         for (const auto& f : found)
         {
             out.push_back(f.second);
+            ds += " " + std::to_string(f.first);
         }
-        if (out.empty())
-        {
-            err = "位姿 IK 无解（精确解）：目标超出工作空间或姿态不可达";
-        }
-        else
-        {
-            std::string ds;
-            for (const auto& f : found)
-            {
-                ds += " " + std::to_string(f.first);
-            }
-            RCLCPP_INFO(node_->get_logger(),
-                        "位姿 IK 得到 %zu 组候选解，距当前构型(rad):%s",
-                        out.size(), ds.c_str());
-        }
+        RCLCPP_INFO(node_->get_logger(),
+                    "位姿 IK：剔除自碰/越界 %zu 组后可用 %zu 组（距当前构型 rad:%s）",
+                    rejected, out.size(), ds.c_str());
         return out;
     }
 
@@ -529,6 +677,11 @@ private:
 
     rclcpp::Subscription<Bool>::SharedPtr gripper_sub_;
     rclcpp::Subscription<FloatArray>::SharedPtr joint_cmd_sub_;
+    rclcpp::Client<moveit_msgs::srv::GetStateValidity>::SharedPtr
+        validity_cli_;
+    std::string last_invalid_reason_;  // 最近一次不合法原因
+    size_t invalid_log_count_ = 0;     // 剔除构型的日志条数（限流）
+    size_t ik_unconverged_ = 0;        // 丢弃的"未收敛" IK 解条数
     rclcpp::Subscription<PoseCommand>::SharedPtr pose_cmd_sub_;
 
     rclcpp::CallbackGroup::SharedPtr action_cb_group_;
