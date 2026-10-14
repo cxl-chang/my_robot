@@ -192,12 +192,13 @@ def generate_launch_description():
             description='按观测点实际距离自动标定前进距离（换观测点后不必手标 '
                         'grasp_forward/tool_y；关掉则用固定值）'),
         DeclareLaunchArgument(
-            'pregrasp_z', default_value='0.60',
+            'pregrasp_z', default_value='0.68',
             description='预抓取工具高度（自由规划用，要高于可规划下限 ~0.45）'),
         DeclareLaunchArgument(
-            'grasp_z', default_value='0.50',
+            'grasp_z', default_value='0.58',
             description='抓取工具高度（笛卡尔下压终点）。这个值由指爪长度决定：'
-                        '指爪底端在世界 z = grasp_z - 0.10，台面 0.40 → 0.50 刚好贴面'
+                        '指爪底端 = grasp_z-0.10 = 0.48 = 取件台面（台面 0.48/方块中心 0.505）。'
+                        '⚠ 不能低于 0.55：工具 z<0.52 时手腕要擦过肩部、全部 IK 解自碰'
                         '且完整包住方块。改指关节 origin 的 z 必须同步改这里'),
         DeclareLaunchArgument(
             'lift_z', default_value='0.70', description='抬起工具高度'),
