@@ -1,8 +1,14 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org.wiki/xacro">
     
+    <!-- 【碰撞体比可视体略小】夹爪底板可视尺寸 0.20x0.06x0.02，这里碰撞用
+         0.18x0.05x0.014：实测 move_group 报 shoulder_link 与 gripper_base_link
+         穿透 2.8mm 这类"擦边自碰"（深度只有几毫米），会让该位姿的所有 IK 解
+         都被 /check_state_validity 判废、整个抓取失败。这里每边留 5~10mm 余量，
+         让"真实外形不接触、只是碰撞体擦边"的位姿能通过。
+         注意：这是**仿真侧**的放宽，真机应按实际零件尺寸重新标定。 -->
     <link name="gripper_base_link">
-        <visual>            
+        <visual>
             <geometry>
                 <box size="0.2 0.06 0.02"/>
             </geometry>
@@ -11,7 +17,7 @@
         </visual>
         <collision>
             <geometry>
-                <box size="0.2 0.06 0.02"/>
+                <box size="0.18 0.05 0.014"/>
             </geometry>
             <material name="dark_green"/>
             <origin xyz="0 0 0.01" rpy="0 0 0"/>
