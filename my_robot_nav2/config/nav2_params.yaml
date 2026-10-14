@@ -177,7 +177,10 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
-      min_vel_x: 0.0
+      # 放开小幅倒车：抓取点闭环微调需要"往后退一点"（方块落得太近时再往前
+      # 手臂就会折到肩膀上自碰）。原来 min_vel_x=0 意味着任何后退都要先原地
+      # 掉头，而取件台前只有 ~0.34m 净空、车体回转半径 0.39m —— 掉头会扫到台子。
+      min_vel_x: -0.10
       min_vel_y: 0.0
       max_vel_x: 0.26
       max_vel_y: 0.0
