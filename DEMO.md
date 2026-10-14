@@ -119,7 +119,14 @@ ros2 run my_robot_task_orchestrator task_sender --ros-args \
 | `obs_frame` | `map` | 观测点坐标系 |
 | `base_axle_offset` | `0.15` | 导航坐标系(base_footlink=差速转心)与 base_link 的 x 差；见下方"坐标系约定" |
 | `enable_pick` | `true` | 是否执行真实抓取（false = 退回旧占位行为，只导航） |
-| `grasp_forward` | `0.175` | 观测点→抓取点沿朝向前进距离（m） |
+| `grasp_forward` | `0.175` | 观测点→抓取点前进距离（m）。**`grasp_auto=true` 时不用它**：抓取点由方块 map 位置反解 |
+| `grasp_auto` | `true` | 抓取点 = 方块位置 − R(obs_yaw)·(tool_x,tool_y)，与到位时车头朝向无关（否则 ±11° 朝向误差会让方块在 base 系 y 上飘 0.28 m） |
+| `grasp_auto_max_fwd` | `1.2` | 反解出的抓取点离观测点超过它就认为 `object_x/object_y` 不对，退回固定前进 |
+| `grasp_x_min` | `0.42` | 竖直下抓安全窗口**下界**（再近手臂折叠撞肩，实测 bx=0.384 穿透 28.9mm）|
+| `grasp_x_mid` | `0.435` | 微调瞄准的窗口中间值 |
+| `creep_vel` / `creep_settle` | `0.08` / `0.8` | 抓取点微调**直接发 `/cmd_vel` 蠕动**（不走导航），死区 `creep_deadband=5mm` |
+| `grasp_reach_x_max` | `0.45` | 固定点竖直下抓的 x 上限（**不是 0.50**：z=0.50 时 joint3 限位把半径卡在 ~0.45，超了直降只算到 75%） |
+| `grasp_correct_min` | `0.12` | 补进的最小步长。小于 Nav2 的 `xy_goal_tolerance`(0.05) 时导航会判"已到位"一步不走；导航还总在目标前 ~0.05m 就停，所以取 0.12 使实际约走 0.07 |
 | `tool_x` / `tool_y` | `0.42` / `0.078` | 抓取时物体在 base_link 系的位置（机械臂那一侧） |
 | `pregrasp_z` | `0.60` | 预抓取工具高度（必须 ≥ 0.45，见 `PICK_PLACE.md`） |
 | `grasp_z` | `0.50` | 抓取工具高度（由指爪长度定；指爪底端 = grasp_z − 0.10） |
