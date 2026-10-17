@@ -869,3 +869,66 @@ continuous 关节，解大量落在 ±π 边界上；笛卡尔插补走到 88.9%
 `gripper_base_link` 的**碰撞体**从 `0.2×0.06×0.02` 缩到 `0.18×0.05×0.014`
 （可视体不动）。原因：深度只有几毫米的"擦边自碰"会让该位姿**所有** IK 解被判废。
 这是**仿真侧**放宽，真机应按实际零件尺寸重新标定。
+
+### 6. 位姿目标少走 15cm：`kArmFrame` 改成 base_link 时漏了换算
+
+**这是"导航到位时夹爪大致在方块上方，一开始抓取、机械臂换完姿态夹爪就跑到方块
+后方"的根因**，也是抓取失败却一路报"成功"的原因。
+
+改 F2（底盘点/差速转心分离）时，把 `kArmFrame` 从 `base_footlink` 改成了
+`base_link`，并在注释里写了"别用 base_footlink，会让每个臂目标偏 15cm"。
+但这句只对了一半 —— **MoveIt 里"吃 Pose"的接口各自的坐标系约定不一样**：
+
+| 接口 | 用哪个坐标系 |
+|---|---|
+| `setJointValueTarget(PoseStamped)` | 按 `header.frame_id` 做 TF 换算 ✅ |
+| `setFromIK(jmg, pose, ...)` | **模型坐标系**，忽略 frame_id ❌ |
+| `computeCartesianPath(waypoints)` | **模型坐标系** ❌ |
+| `getGlobalLinkTransform()`（FK） | **模型坐标系** ❌ |
+
+模型坐标系 = SRDF 的根：`<virtual_joint ... child_link="base_footlink"/>`，
+而 `base_joint` 的 origin 是 `${base_length/4} 0 ${wheel_radius}` ⇒
+**base_link 在 base_footlink 前方 0.15m**。所以把 base_link 数字直接喂给
+`setFromIK` / `computeCartesianPath`，工具就少走 0.15m：
+
+```
+命令 tool 到 base 系 (0.42, y, 0.58)
+  → 实际工具停在 base 系 x = 0.27  ← 少 15cm，"夹爪在方块后方"
+```
+
+**为什么一直没被发现**（三个掩盖源，都占了）：
+
+* `verifyAchieved` 拿**模型系 FK** 去比**未换算的 base_link 数字**，
+  两个 15cm 恰好互相抵消 ⇒ 误差算成 0，一路报"到位"；
+* §3 加的 FK 自校验有同一个盲区：它验证的是"IK 解是否收敛"，不是"目标位姿的
+  坐标系对不对"，两边都在模型系里，自然一致；
+* DetachableJoint 是"假吸附"：位置差 15cm 也照样把方块 snap 过来，
+  而**放置链走的是标定关节目标**（与坐标系无关）⇒ 放置看起来完全正常，
+  于是问题被误判成"识别/定位偏差"。
+
+**修法**（`commander.cpp`）：`goPose()` 里用 `toModelFrame()` 统一换算一次，
+再把换算后的目标交给 `poseIkCandidates()`、`computeCartesianPath()` 的 waypoints
+和 `verifyAchieved()`。
+
+换算量**不写死**：`initModelFrameOffset()` 在启动时用 MoveIt 的 `RobotModel` 查
+`getGlobalLinkTransform("base_link")`（即 URDF 里 `base_joint` 的 origin），
+平移和旋转都跟着 URDF 走 —— 以后改 `base_length`、或给 `base_joint` 加俯仰，
+这里自动跟上。启动日志会打印：
+
+```
+模型系(root=base_footlink) ← base_link：平移 (0.150, 0.000, 0.100) m（URDF 动态读取）
+```
+
+**z 的平移默认不跟随**（参数 `model_offset_z_apply`，默认 `false`），理由见下。
+
+**z 平移故意不跟随，不是 `wheel_radius=0.1`**：`grasp_z`/`pregrasp_z`/`lift_z`
+一直是按"工具**离地高度**"标定的（模型系 z 恰好等于离地高度）。若把 z 也加 0.1，
+抓取会整体抬高 10cm，夹爪只能夹到方块顶面（0.53）而不是方块腰身。
+要改成严格的 base_link 语义，把 `model_offset_z_apply` 设为 `true`，并同时把
+这三个参数**各减 0.1**，物理效果不变。
+
+**顺带修正一条旧结论**：§3 里"命令 x≥0.46~0.47 会撞 joint3 限位、笛卡尔卡在
+75~78%"其实是这个 bug 的副产物 —— 那些"命令值"换算成物理位置只有 base_link
+x≈0.31，工具离肩关节仅 ≈0.20m（手臂折得很死）。修正后同一个方块位置是
+离肩 ≈0.35m，手臂反而更舒展。**所以 0.42~0.45 这个安全窗口不用改**，
+它本来就是 base_link 系下的正确值。

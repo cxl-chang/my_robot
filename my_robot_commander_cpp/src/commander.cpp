@@ -58,6 +58,16 @@ namespace {
 // 等标定值也都是相对它量的）。别改成 base_footlink：URDF 里 base_footlink 是
 // 差速转心（轮轴中点），在 base_link 后方 base_length/4=0.15m，用它当参考系
 // 会让每个臂目标整体偏 15cm。
+//
+// 【实测补记 —— 上面这句话只对了一半，正是"夹爪停在方块后方"的根因】
+// 光把 frame_id 写成 base_link 并**不够**：
+//   * setJointValueTarget(PoseStamped) 会按 header.frame_id 做 TF 换算；
+//   * 但 setFromIK()、computeCartesianPath() 的 waypoints、以及
+//     getGlobalLinkTransform() 全都按**模型坐标系**解释，直接忽略 frame_id。
+// 模型系 = SRDF 的根 = base_footlink（virtual_joint 的 child_link），它在
+// base_link 后方 0.15m（base_joint 的 origin x=base_length/4）⇒ 把 base_link
+// 数字直接喂进去，手臂就**少走 15cm**。现象正是"导航到位时夹爪大致在方块上方，
+// 一换成抓取姿态就跑到方块后方"。见 toModelFrame()。
 constexpr char kArmFrame[] = "base_link";
 // 执行后"到位校验"允许的位置误差（米）。超过就判这次动作失败。
 constexpr double kAchieveTol = 0.005;  // 5mm
@@ -83,6 +93,8 @@ public:
         plan_time_cap_ = node_->get_parameter("plan_time_cap").as_double();
 
         arm = std::make_shared<MoveGroupInterface>(node_, "arm");
+        // 模型系 ← base_link 的换算量从 URDF 读（不写死 0.15），见 toModelFrame()
+        initModelFrameOffset();
         validity_cli_ = node_->create_client<moveit_msgs::srv::GetStateValidity>(
             "check_state_validity");
         arm->setMaxAccelerationScalingFactor(1.0);
@@ -441,6 +453,81 @@ public:
         return out;
     }
 
+    /// 查"模型系 ← base_link"的固定位姿，启动时调用一次（用法见 toModelFrame）。
+    ///
+    /// 不写死常数：以前这里是手抄的 0.15（= base_length/4）。`base_length` 一改，
+    /// 换算就悄悄错位，而错位又正好被"到位校验也算错"抵消掉，只表现为抓不准。
+    /// 现在直接问 MoveIt 的 RobotModel（即 URDF）：SRDF 的根是 base_footlink
+    /// （`<virtual_joint ... child_link="base_footlink"/>`），base_link 相对它的
+    /// 位姿就是 base_joint 的 origin —— 代码里不再出现任何魔法数。
+    void initModelFrameOffset()
+    {
+        auto model = arm->getRobotModel();
+        if (!model)
+        {
+            RCLCPP_ERROR(node_->get_logger(),
+                         "拿不到 RobotModel：位姿目标不做换算，手臂会少走一截");
+            return;
+        }
+        moveit::core::RobotState rs(model);
+        rs.setToDefaultValues();
+        rs.update();
+        base_link_in_model_ = rs.getGlobalLinkTransform(kArmFrame);
+        const Eigen::Vector3d t = base_link_in_model_.translation();
+        RCLCPP_INFO(node_->get_logger(),
+                    "模型系(root=%s) ← %s：平移 (%.3f, %.3f, %.3f) m（URDF 动态读取）",
+                    model->getRootLinkName().c_str(), kArmFrame, t.x(), t.y(), t.z());
+        if (t.head<2>().norm() < 1e-6)
+        {
+            RCLCPP_WARN(node_->get_logger(),
+                        "%s 与模型系根重合，换算是恒等映射；若根本该是 base_footlink，"
+                        "请检查 SRDF 的 virtual_joint", kArmFrame);
+        }
+        // z 的平移是否跟随 URDF，默认 false（标定约定，理由见 toModelFrame）
+        node_->declare_parameter("model_offset_z_apply", model_z_apply_);
+        model_z_apply_ = node_->get_parameter("model_offset_z_apply").as_bool();
+    }
+
+    /// base_link → MoveIt 模型坐标系 的固定换算（平移+旋转，启动时从 URDF 读）。
+    ///
+    /// 为什么必须换算：`setFromIK()`、`computeCartesianPath()` 的 waypoints、
+    /// `getGlobalLinkTransform()` 都按**模型坐标系**解释位姿，并且忽略
+    /// `header.frame_id`（只有 `setJointValueTarget(PoseStamped)` 会按 frame_id
+    /// 做 TF）。模型系 = SRDF 根 = base_footlink，在 base_link 后方 0.15m 处，
+    /// 不换算手臂就少走 15cm —— 就是"导航到点夹爪大致对得上、一换成抓取姿态
+    /// 就停在方块后方"的根因。
+    ///
+    /// 为什么 z 分量默认不平移（`model_offset_z_apply=false`）：编排器的
+    /// grasp_z / pregrasp_z / lift_z 一直是按"工具**离地高度**"标定的，而模型系
+    /// z 恰好等于离地高度。若把 z 也加上 wheel_radius=0.1，抓取会整体抬高
+    /// 10cm，夹爪就只能夹到方块顶面（0.53）而不是方块腰身。要改成严格的
+    /// base_link 语义：把该参数设 true，并把这三个高度参数各减 0.1（物理效果
+    /// 完全相同）。
+    geometry_msgs::msg::Pose toModelFrame(const geometry_msgs::msg::Pose& p) const
+    {
+        Eigen::Isometry3d T = base_link_in_model_;
+        if (!model_z_apply_)
+        {
+            T.translation().z() = 0.0;
+        }
+        const Eigen::Vector3d pos =
+            T * Eigen::Vector3d(p.position.x, p.position.y, p.position.z);
+        const Eigen::Quaterniond q_out =
+            Eigen::Quaterniond(T.rotation()) *
+            Eigen::Quaterniond(p.orientation.w, p.orientation.x,
+                               p.orientation.y, p.orientation.z);
+
+        geometry_msgs::msg::Pose out = p;
+        out.position.x = pos.x();
+        out.position.y = pos.y();
+        out.position.z = pos.z();
+        out.orientation.x = q_out.x();
+        out.orientation.y = q_out.y();
+        out.orientation.z = q_out.z();
+        out.orientation.w = q_out.w();
+        return out;
+    }
+
     bool goPose(double x, double y, double z, double roll, double pitch,
                 double yaw, bool use_cartesian, std::string& err)
     {
@@ -459,6 +546,12 @@ public:
         target_pose.pose.orientation.w = q.w();
 
         arm->setStartStateToCurrentState();
+
+        // 统一换算一次：下面所有"吃 Pose"的 MoveIt 接口都按模型系(base_footlink)
+        // 解释，见 toModelFrame() 的说明。verifyAchieved 也必须用换算后的位姿，
+        // 否则它拿模型系 FK 去比 base_link 数字，差值恰好互相抵消、一路报"到位"。
+        geometry_msgs::msg::PoseStamped model_target = target_pose;
+        model_target.pose = toModelFrame(target_pose.pose);
 
         if (!use_cartesian)
         {
@@ -492,7 +585,7 @@ public:
             //  按"离当前构型由近到远"排序后**逐个尝试规划+执行+到位校验**：
             //  近解优先（少动、且几乎总能规划出来），近解规划不出来再退到远解，
             //  避免一次坏种子就判死整个抓取任务。
-            const auto candidates = poseIkCandidates(target_pose, err);
+            const auto candidates = poseIkCandidates(model_target, err);
             if (candidates.empty())
             {
                 RCLCPP_ERROR(node_->get_logger(), "%s", err.c_str());
@@ -515,7 +608,7 @@ public:
                     last_err = e;
                     continue;  // 这一组规划不出来，试下一组
                 }
-                if (verifyAchieved(target_pose, e))
+                if (verifyAchieved(model_target, e))
                 {
                     return true;
                 }
@@ -531,7 +624,7 @@ public:
         // 否则 MoveIt 可能选到另一组 IK 解，产生关节空间大跳变，
         // 表现为"手臂甩一下才到位"，还会把已经对好的方块蹭飞。
         std::vector<geometry_msgs::msg::Pose> waypoints;
-        waypoints.push_back(target_pose.pose);
+        waypoints.push_back(model_target.pose);
         moveit_msgs::msg::RobotTrajectory trajectory;
 
         const double jump_threshold = 0.0;
@@ -550,7 +643,7 @@ public:
         RCLCPP_INFO(node_->get_logger(),
                     "笛卡尔路径完成度 %.1f%%，开始执行", fraction * 100.0);
         arm->execute(trajectory);
-        return verifyAchieved(target_pose, err);
+        return verifyAchieved(model_target, err);
     }
 
     // ================= action server =================
@@ -688,6 +781,10 @@ private:
     rclcpp_action::Server<ArmTask>::SharedPtr action_server_;
     std::atomic<bool> busy_{false};
     double plan_time_cap_ = 20.0;   // 规划预算上限，见构造函数注释
+    // 模型系(SRDF 根) ← base_link 的固定位姿，启动时从 URDF 查，见 toModelFrame()
+    Eigen::Isometry3d base_link_in_model_ = Eigen::Isometry3d::Identity();
+    // z 的平移是否跟随 URDF：默认 false = 不跟随（标定约定），见 toModelFrame()
+    bool model_z_apply_ = false;
 
     // ---------- 话题回调（手动调试用，忽略成功与否） ----------
     void openGripper()  { std::string e; goNamed("gripper", "gripper_open", e); }
