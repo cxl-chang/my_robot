@@ -11,6 +11,9 @@
 
   <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
+  <depend>moveit_msgs</depend>
+  <depend>shape_msgs</depend>
+  <depend>tf2_msgs</depend>
   <depend>my_robot_interfaces</depend>
 
   <test_depend>ament_lint_auto</test_depend>

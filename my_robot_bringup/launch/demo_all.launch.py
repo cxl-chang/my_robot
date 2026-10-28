@@ -85,6 +85,11 @@ def generate_launch_description():
     place_approach_z = LaunchConfiguration('place_approach_z')
     place_down_z = LaunchConfiguration('place_down_z')
     attach_enabled = LaunchConfiguration('attach_enabled')
+    scene_tables = LaunchConfiguration('scene_tables')
+    scene_cube = LaunchConfiguration('scene_cube')
+    scene_attach = LaunchConfiguration('scene_attach')
+    scene_place_table = LaunchConfiguration('scene_place_table')
+    scene_cube_source = LaunchConfiguration('scene_cube_source')
     use_detachable = LaunchConfiguration('use_detachable')
     gz_args = LaunchConfiguration('gz_args')
     arm_timeout = LaunchConfiguration('arm_timeout')
@@ -226,6 +231,28 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'attach_enabled', default_value='true',
             description='是否用 DetachableJoint 吸附（仿真抓取可靠性）'),
+        # --- MoveIt 碰撞世界（把方块/台子放进 planning scene）---
+        # 逐级验证用：\n        #   ① 先只开 scene_tables，RViz 里应看到取件台；
+        #   ② 再开 scene_cube，识别后应看到方块（日志打印真值/参数偏差）；
+        #   ③ 抓一次，若会撞方块，下压应变成"路径碰撞"失败；
+        #   ④ scene_attach 负责抓起后挂到夹爪；
+        #   ⑤ 最后再开 scene_place_table。
+        DeclareLaunchArgument(
+            'scene_tables', default_value='true',
+            description='把取件台加进 MoveIt 碰撞世界（第①步）'),
+        DeclareLaunchArgument(
+            'scene_cube', default_value='true',
+            description='把方块加进 MoveIt 碰撞世界（第②步）'),
+        DeclareLaunchArgument(
+            'scene_attach', default_value='true',
+            description='抓起后把方块从世界摘掉、挂到夹爪（第④步）'),
+        DeclareLaunchArgument(
+            'scene_place_table', default_value='false',
+            description='把放置台也加进碰撞世界（第⑤步，默认关）'),
+        DeclareLaunchArgument(
+            'scene_cube_source', default_value='truth',
+            description='方块位姿来源：truth=Gazebo 真值 /gz_pose_info，'
+                        'param=object_x/object_y 参数'),
         DeclareLaunchArgument(
             'gz_args',
             default_value=os.path.join(
@@ -365,6 +392,11 @@ def generate_launch_description():
             'place_via': place_via,
             'place_via_dist': place_via_dist,
             'attach_enabled': attach_enabled,
+            'scene_tables': scene_tables,
+            'scene_cube': scene_cube,
+            'scene_attach': scene_attach,
+            'scene_place_table': scene_place_table,
+            'scene_cube_source': scene_cube_source,
             'arm_timeout': arm_timeout,
         }])
 

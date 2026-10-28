@@ -932,3 +932,45 @@ continuous 关节，解大量落在 ±π 边界上；笛卡尔插补走到 88.9%
 x≈0.31，工具离肩关节仅 ≈0.20m（手臂折得很死）。修正后同一个方块位置是
 离肩 ≈0.35m，手臂反而更舒展。**所以 0.42~0.45 这个安全窗口不用改**，
 它本来就是 base_link 系下的正确值。
+
+### 7. 方块/台子进 MoveIt 碰撞世界（把"静默蹭到"变成明确失败）
+
+**问题**：仓库里从来没有往 MoveIt 的 planning scene 加过任何东西（全文没有
+`PlanningScene` / `CollisionObject` / `apply_planning_scene` 调用），碰撞检查只
+看"机器人自己"。手臂实际压到方块顶面时，笛卡尔照样报 `100.0%`，只能靠肉眼
+发现"偶尔碰到方块顶部"。
+
+**做法**（编排器实现，五个开关，可逐级验证）：
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `scene_tables` | true | 任务开始时加取件台（验证 diff 通路） |
+| `scene_cube` | true | 识别成功后按方块位姿加方块 |
+| `scene_attach` | true | 抓起后从世界摘掉、挂到 `tool_link`（`touch_links` 放行夹爪） |
+| `scene_place_table` | **false** | 放置台（台面 + 支柱），最后再开 |
+| `scene_cube_source` | `truth` | 方块位姿来源：Gazebo 真值 / 参数 |
+
+关键实现细节：
+
+* **必须 `is_diff = True`**：否则整份覆盖，会把别人加的物体（RViz、octomap）清掉；
+* **取件台顶面压低 5mm**（`scene_table_shrink`）：竖直下抓时指尖本来就落到
+  0.48 = 台面，用真实台面高会让**每一次**下压都被判碰撞；压 5mm 后余量 5mm，
+  既不误报也不失去防护意义；
+* **方块膨胀 5mm**（`scene_cube_padding`）：吃掉参数/感知误差，避免"擦边"规划；
+* **attach 相对位姿 = `grasp_z − object_z` = 0.075m**：方块中心在工具系 +z 方向，
+  跟参数联动，不写死；
+* **真值来源**：`gazebo_bridge.yaml` 新增 `/gz_pose_info`（桥
+  `/world/empty/pose/info` → `tf2_msgs/TFMessage`）。编排器只在"真值与参数推算
+  差 <0.5m"时采信真值，否则警告并退回参数（防坐标系不一致把方块扔到别处）。
+  识别时会打印一行
+  `方块位姿[truth] map=(...) | 参数=(...) | 偏差=(+3,+21)mm`
+  —— 这就是"参数位置 vs 真值"的量化，可直接用来判断要不要上视觉定位。
+
+**这会带来一个刻意的行为变化**：碰撞世界里的方块用**真值**，而抓取目标仍用
+**参数 belief** 推算。两者一旦不一致，"手臂会不会撞到方块"就从"默默撞上"变成
+**下压阶段明确的规划失败**（`笛卡尔路径只算到 xx%` / 路径碰撞）。这正是第③步
+要观察的现象：失败说明 belief 偏了，先修定位/复位方块，而不是回头怀疑识别。
+
+> 注意：`build/install` 里的 Python 包是**副本不是软链**，改完
+> `orchestrator.py` 必须 `colcon build --packages-select my_robot_task_orchestrator`
+> 才会生效（本次已重建）。

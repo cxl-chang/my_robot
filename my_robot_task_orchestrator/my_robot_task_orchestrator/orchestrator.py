@@ -39,6 +39,12 @@ from rclpy.qos import (QoSProfile, DurabilityPolicy)
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Empty
+from geometry_msgs.msg import Pose
+from moveit_msgs.msg import (PlanningScene, PlanningSceneWorld, CollisionObject,
+                             AttachedCollisionObject)
+from moveit_msgs.srv import ApplyPlanningScene
+from shape_msgs.msg import SolidPrimitive
+from tf2_msgs.msg import TFMessage
 from my_robot_interfaces.msg import (
     TaskCommand, TaskStatus, NavGoal, NavStatus, ObjectDetection)
 from my_robot_interfaces.action import ArmTask
@@ -200,6 +206,45 @@ class TaskOrchestrator(Node):
         self.declare_parameter('nav_arrive_slack', 0.30)
         # 里程计话题：用于把"小步移动"叠加到最近一次 AMCL 位姿上（见 _map_pose）
         self.declare_parameter('odom_topic', '/odom')
+        # --- MoveIt 规划场景（碰撞体）---
+        # 为什么要有这些开关：MoveIt 的碰撞检查只看 planning scene，而这里一直是
+        # 空的 ⇒ 手臂真撞到方块/桌子，规划照样报 100% 成功，只能靠肉眼发现
+        # "偶发蹭到方块顶部"。加进去之后这类接触会变成明确的规划失败。
+        # 分步开关，便于逐级验证（对应落地方案的第①②④⑤步）：
+        #   scene_tables   ①任务开始时加取件台（验证 diff 通路）
+        #   scene_cube     ②识别后按方块位姿加方块
+        #   scene_attach   ④抓取成功后摘出世界、挂到夹爪（touch_links 放行）
+        #   scene_place_table ⑤放置台与放置侧，默认先关
+        self.declare_parameter('scene_enable', True)
+        self.declare_parameter('scene_frame', 'map')
+        self.declare_parameter('scene_apply_service', '/apply_planning_scene')
+        self.declare_parameter('scene_tables', True)
+        self.declare_parameter('scene_place_table', False)
+        self.declare_parameter('scene_cube', True)
+        self.declare_parameter('scene_attach', True)
+        self.declare_parameter('scene_attach_link', 'tool_link')
+        # 方块放进碰撞世界时向外膨胀的量：吃掉参数/感知误差，避免"擦边"规划
+        self.declare_parameter('scene_cube_padding', 0.005)
+        # 台面顶面压低多少：竖直下抓时指尖本来就要贴到台面(0.48)，用真实台面高
+        # 会让每次下压都被判碰撞。压 5mm 既不误报，也不失去防护意义。
+        self.declare_parameter('scene_table_shrink', 0.005)
+        # 方块位姿来源：truth=/gz_pose_info（Gazebo 真值），param=object_x/object_y
+        self.declare_parameter('scene_cube_source', 'truth')
+        self.declare_parameter('truth_topic', '/gz_pose_info')
+        self.declare_parameter('truth_link', 'red_cube')
+        # 真值与参数推算差超过这个值就认为坐标系不一致，退回参数
+        self.declare_parameter('truth_max_dev', 0.50)
+        # 方块中心离地高度（台面 0.48 + 半高 0.025）
+        self.declare_parameter('object_z', 0.505)
+        # 取件台几何（与 test_world.sdf 的 PickTable 一致）
+        self.declare_parameter('scene_pick_table_xyz', [3.04, 3.0, 0.24])
+        self.declare_parameter('scene_pick_table_size', [0.5, 0.5, 0.48])
+        # 放置台几何（台面 + 支柱，与 test_world.sdf 的 PlaceTable 一致）
+        self.declare_parameter('scene_place_top_xyz', [0.5, 4.5, 0.475])
+        self.declare_parameter('scene_place_top_size', [0.6, 0.6, 0.03])
+        self.declare_parameter('scene_place_pillar_xyz', [0.6, 4.5, 0.23])
+        self.declare_parameter('scene_place_pillar_size', [0.12, 0.12, 0.46])
+
         # --- 吸附（DetachableJoint，仿真专用）---
         self.declare_parameter('attach_enabled', False)
         self.declare_parameter('attach_topic', '/red_cube/attach')
@@ -255,6 +300,26 @@ class TaskOrchestrator(Node):
         self.detach_topic = g('detach_topic').value
         self.detach_on_start = bool(g('detach_on_start').value)
         self.attach_settle = g('attach_settle').value
+        self.scene_enable = bool(g('scene_enable').value)
+        self.scene_frame = g('scene_frame').value
+        self.scene_tables = bool(g('scene_tables').value)
+        self.scene_place_table = bool(g('scene_place_table').value)
+        self.scene_cube_on = bool(g('scene_cube').value)
+        self.scene_attach_on = bool(g('scene_attach').value)
+        self.scene_attach_link = g('scene_attach_link').value
+        self.scene_cube_padding = g('scene_cube_padding').value
+        self.scene_table_shrink = g('scene_table_shrink').value
+        self.scene_cube_source = g('scene_cube_source').value
+        self.truth_topic = g('truth_topic').value
+        self.truth_link = g('truth_link').value
+        self.truth_max_dev = g('truth_max_dev').value
+        self.object_z = g('object_z').value
+        self.scene_pick_xyz = list(g('scene_pick_table_xyz').value)
+        self.scene_pick_size = list(g('scene_pick_table_size').value)
+        self.scene_place_top_xyz = list(g('scene_place_top_xyz').value)
+        self.scene_place_top_size = list(g('scene_place_top_size').value)
+        self.scene_place_pillar_xyz = list(g('scene_place_pillar_xyz').value)
+        self.scene_place_pillar_size = list(g('scene_place_pillar_size').value)
         # --- 抓取可达性校验（防"空抓+假吸附"，详见 _check_grasp_reachable）---
         self.object_x = g('object_x').value     # 方块世界坐标（map 系）
         self.object_y = g('object_y').value
@@ -315,6 +380,15 @@ class TaskOrchestrator(Node):
         self.attach_pub = self.create_publisher(Empty, self.attach_topic, 10)
         self.detach_pub = self.create_publisher(Empty, self.detach_topic, 10)
         self.arm_client = ActionClient(self, ArmTask, '/arm_task')
+        # 规划场景服务（加/删碰撞体、attach/detach 都走它，diff 增量）
+        self.scene_cli = self.create_client(
+            ApplyPlanningScene, g('scene_apply_service').value)
+        # 方块真值（Gazebo /world/<world>/pose/info 桥出的 TFMessage）
+        self.truth_cube = None
+        self._truth_logged = False
+        if self.scene_enable and self.scene_cube_source == 'truth':
+            self.truth_sub = self.create_subscription(
+                TFMessage, self.truth_topic, self.truth_cb, 10)
 
         # ================= 状态 =================
         self.state = TaskStatus.IDLE
@@ -395,6 +469,8 @@ class TaskOrchestrator(Node):
             f'收到任务：抓取 {msg.object_id} → 放置 '
             f'({msg.place_x:.2f},{msg.place_y:.2f}) '
             f'yaw={msg.place_yaw:.2f} frame={msg.place_frame_id}')
+        self._scene_add_tables()
+        self._scene_set_cube(None)      # 清掉上一轮可能残留的方块
         self._nav_to_object()
 
     # ================= 导航 =================
@@ -630,6 +706,7 @@ class TaskOrchestrator(Node):
                 f'({msg.pose.pose.position.x:.3f},{msg.pose.pose.position.y:.3f},'
                 f'{msg.pose.pose.position.z:.3f})')
             self._set_detect(False, '已识别到目标，抓取及之后不再需要')
+            self._scene_cube_on_detect()
             self._begin_pick()
 
     def _begin_pick(self):
@@ -967,12 +1044,179 @@ class TaskOrchestrator(Node):
                 pass
         self.op_goal_handle = None
 
+    # ================= MoveIt 规划场景（碰撞体） =================
+    # 为什么要把方块/台子放进来：MoveIt 的碰撞检查只看 planning scene，而这里
+    # 之前一直是空的 ⇒ 手臂真撞到方块/桌子，规划照样报 100% 成功，只能靠肉眼
+    # 发现"偶发蹭到方块顶部"。加进去之后这类接触会变成明确的规划失败。
+
+    def truth_cb(self, msg):
+        """收 /gz_pose_info（Gazebo 真值），取方块的世界位姿。"""
+        for tr in msg.transforms:
+            if tr.child_frame_id.strip('/') == self.truth_link:
+                t = tr.transform.translation
+                self.truth_cube = (t.x, t.y, t.z)
+                if not self._truth_logged:
+                    self._truth_logged = True
+                    self.get_logger().info(
+                        f'已收到方块真值 /gz_pose_info：{self.truth_link} @ '
+                        f'({t.x:.3f},{t.y:.3f},{t.z:.3f})')
+                return
+
+    def _make_box(self, obj_id, xyz, size, operation=None):
+        """构造一个 box 碰撞体；REMOVE 时只需要 id。"""
+        if operation is None:
+            operation = CollisionObject.ADD
+        co = CollisionObject()
+        co.header.frame_id = self.scene_frame
+        co.header.stamp = self.get_clock().now().to_msg()
+        co.id = obj_id
+        if operation != CollisionObject.REMOVE:
+            co.primitives = [SolidPrimitive(
+                type=SolidPrimitive.BOX,
+                dimensions=[float(v) for v in size])]
+            p = Pose()
+            p.position.x, p.position.y, p.position.z = [float(v) for v in xyz]
+            p.orientation.w = 1.0
+            co.primitive_poses = [p]
+        co.operation = operation
+        return co
+
+    def _apply_scene(self, world=None, attached=None, why=''):
+        """把一份**增量**场景发给 /apply_planning_scene。"""
+        if not self.scene_enable:
+            return
+        if not self.scene_cli.service_is_ready():
+            self.get_logger().warn(f'规划场景服务未就绪，跳过场景更新（{why}）')
+            return
+        diff = PlanningScene()
+        diff.is_diff = True       # 必须增量，否则会把别人加的场景整份清空
+        if world is not None:
+            diff.world = world
+        if attached is not None:
+            diff.robot_state.attached_collision_objects = attached
+        fut = self.scene_cli.call_async(ApplyPlanningScene.Request(scene=diff))
+        fut.add_done_callback(lambda f: self._scene_done(f, why))
+
+    def _scene_done(self, fut, why):
+        try:
+            ok = fut.result().success
+        except Exception as e:      # noqa: BLE001
+            self.get_logger().warn(f'规划场景更新失败（{why}）: {e}')
+            return
+        if ok:
+            self.get_logger().info(f'规划场景已更新（{why}）')
+        else:
+            self.get_logger().warn(f'规划场景更新被拒绝（{why}）')
+
+    def _scene_add_tables(self):
+        """step①：任务开始时把静态台子放进碰撞世界。"""
+        if not (self.scene_enable and self.scene_tables):
+            return
+        objs = []
+        x, y, z = self.scene_pick_xyz
+        sx, sy, sz = self.scene_pick_size
+        shrink = self.scene_table_shrink
+        sz2 = max(0.05, sz - shrink)        # 顶面压低，指尖贴台面不误报
+        objs.append(self._make_box(
+            'pick_table', (x, y, z - (sz - sz2) / 2.0), (sx, sy, sz2)))
+        top_z = z + sz / 2.0 - shrink
+        if self.scene_place_table:
+            objs.append(self._make_box('place_table_top',
+                                       self.scene_place_top_xyz,
+                                       self.scene_place_top_size))
+            objs.append(self._make_box('place_pedestal',
+                                       self.scene_place_pillar_xyz,
+                                       self.scene_place_pillar_size))
+        self._apply_scene(world=PlanningSceneWorld(collision_objects=objs),
+                          why='加入台子')
+        self.get_logger().info(
+            f'规划场景：台子 {[o.id for o in objs]}，取件台顶面 {top_z:.3f} m'
+            f'（已压低 {shrink * 1000:.0f}mm，防指尖贴台面误报）')
+
+    def _cube_world_xyz(self):
+        """方块在 map 系的位姿：优先真值，与参数推算差太多则退回参数。"""
+        bx, by, bz = self.object_x, self.object_y, self.object_z
+        if self.truth_cube is None:
+            return bx, by, bz, 'param'
+        tx, ty, tz = self.truth_cube
+        dev = math.hypot(tx - bx, ty - by)
+        if dev > self.truth_max_dev:
+            self.get_logger().warn(
+                f'方块真值({tx:.3f},{ty:.3f}) 与参数({bx:.3f},{by:.3f}) 差 '
+                f'{dev * 1000:.0f}mm > {self.truth_max_dev:.2f}m，'
+                f'可能不是同一坐标系，退回参数')
+            return bx, by, bz, 'param'
+        return tx, ty, tz, 'truth'
+
+    def _scene_set_cube(self, xyz=None):
+        """step②：按位姿放/删方块（同一份 diff 里先删后加，避免残留）。"""
+        if not (self.scene_enable and self.scene_cube_on):
+            return
+        objs = [self._make_box('red_cube', (0, 0, 0), (0, 0, 0),
+                               CollisionObject.REMOVE)]
+        if xyz is not None:
+            s = 0.05 + 2.0 * self.scene_cube_padding
+            objs.append(self._make_box('red_cube', xyz, (s, s, s)))
+        self._apply_scene(world=PlanningSceneWorld(collision_objects=objs),
+                          why='加入方块' if xyz else '移除方块')
+
+    def _scene_cube_on_detect(self):
+        """step②：识别成功后加方块，并把"真值 / 参数"的偏差打出来。"""
+        if not (self.scene_enable and self.scene_cube_on):
+            return
+        x, y, z, src = self._cube_world_xyz()
+        dx = (x - self.object_x) * 1000.0
+        dy = (y - self.object_y) * 1000.0
+        self.get_logger().info(
+            f'方块位姿[{src}] map=({x:.3f},{y:.3f},{z:.3f}) | '
+            f'参数=({self.object_x:.3f},{self.object_y:.3f},{self.object_z:.3f}) | '
+            f'偏差=({dx:+.0f},{dy:+.0f})mm')
+        self._scene_set_cube((x, y, z))
+
+    def _scene_attach_cube(self):
+        """step④：抓取成功后把方块从世界摘掉、挂到 tool_link（放行夹爪接触）。"""
+        if not (self.scene_enable and self.scene_attach_on):
+            return
+        dz = self.grasp_z - self.object_z     # 方块中心在工具系 +z 的距离
+        aco = AttachedCollisionObject()
+        aco.link_name = self.scene_attach_link
+        aco.object = self._make_box('red_cube', (0.0, 0.0, dz),
+                                    (0.05, 0.05, 0.05))
+        aco.touch_links = [self.scene_attach_link, 'gripper_base_link',
+                           'gripper_left_finger_link',
+                           'gripper_right_finger_link', 'hand_link']
+        self._apply_scene(
+            world=PlanningSceneWorld(collision_objects=[
+                self._make_box('red_cube', (0, 0, 0), (0, 0, 0),
+                               CollisionObject.REMOVE)]),
+            attached=[aco], why='方块挂到夹爪')
+
+    def _scene_detach_cube(self):
+        """放置脱开后：MoveIt 侧也摘掉（世界位姿等下轮识别重新加）。"""
+        if not (self.scene_enable and self.scene_attach_on):
+            return
+        aco = AttachedCollisionObject()
+        aco.link_name = self.scene_attach_link
+        aco.object = self._make_box('red_cube', (0, 0, 0), (0, 0, 0),
+                                    CollisionObject.REMOVE)
+        self._apply_scene(attached=[aco], why='方块脱离夹爪')
+        self._scene_set_cube(None)
+
+    def _scene_cleanup(self):
+        """任务结束/失败：把方块从场景里清掉，避免影响下一次任务。"""
+        if not self.scene_enable:
+            return
+        self._scene_detach_cube()
+
     # ================= 吸附（DetachableJoint） =================
     def _do_attach(self):
         self._pub_empty(self.attach_pub, f'吸附 attach → {self.attach_topic}')
+        # MoveIt 侧同步：世界里的方块摘掉、挂到夹爪，否则搬运规划会绕着它走
+        self._scene_attach_cube()
 
     def _do_detach(self):
         self._pub_empty(self.detach_pub, f'脱开 detach → {self.detach_topic}')
+        self._scene_detach_cube()
 
     def startup_detach_cb(self):
         """上电后补几次脱开，抵消 DetachableJoint 在 Configure 时的自动连接。"""
@@ -1129,6 +1373,7 @@ class TaskOrchestrator(Node):
     # ================= 收尾 =================
     def _task_done(self):
         self.cmd_vel_pub.publish(Twist())      # 收尾同样清零底盘
+        self._scene_cleanup()
         self.creep_start = None
         self.creep_settle_until = None
         self._set_detect(False, '任务结束')
@@ -1139,6 +1384,7 @@ class TaskOrchestrator(Node):
 
     def _fail(self, reason):
         self._cancel_arm()
+        self._scene_cleanup()
         # 【安全】必须先停底盘：蠕动微调是按 /cmd_vel 开环发的，而底盘插件会
         # 一直保持最后一条指令 —— 不在失败路径上清零，车会带着 0.08m/s 一直走。
         self.cmd_vel_pub.publish(Twist())

@@ -78,3 +78,12 @@
   ros_type_name: "std_msgs/msg/Empty"
   gz_type_name: "ignition.msgs.Empty"
   direction: GZ_TO_ROS
+# 世界内所有模型的真值位姿（桥成 TFMessage，child_frame_id = 模型名）。
+# 用途：把"方块实际在哪"放进 MoveIt 的碰撞世界，并顺便量化
+# "参数位置(object_x/object_y) vs 真值"的偏差。没桥到这个话题时
+# 编排器会自动退回参数（scene_cube_source=truth 但 truth 收不到 → param）。
+- ros_topic_name: "/gz_pose_info"
+  gz_topic_name: "/world/empty/pose/info"
+  ros_type_name: "tf2_msgs/msg/TFMessage"
+  gz_type_name: "ignition.msgs.Pose_V"
+  direction: GZ_TO_ROS
