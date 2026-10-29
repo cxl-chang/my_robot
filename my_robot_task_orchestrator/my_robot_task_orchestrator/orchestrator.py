@@ -156,6 +156,12 @@ class TaskOrchestrator(Node):
         # 导航总在目标前 ~0.045m 就判到位（xy_goal_tolerance=0.05），前后都一样，
         # 所以"目标步长 = 期望位移 + 这个量"，否则微调会走不够。
         self.declare_parameter('grasp_park_shortfall', 0.045)
+        # 【抓取点提前停车距离】只让 Nav2 做"粗到位"，最后这一段用 /cmd_vel
+        # 蠕动闭环完成。为什么：从观测点到抓取点只有 ~0.18m，比 xy_goal_tolerance
+        # (0.05) 大不了多少，而这一段又紧贴取件台（inflation 0.55）——实测 Nav2 在
+        # 这里会反复 1Hz 重规划、原地振荡，直到 recovery 的 spin 才对齐，耗时 30s+。
+        # 蠕动的精度只取决于 odom（干净），0.15m 约 2s，且完全确定。
+        self.declare_parameter('grasp_park_margin', 0.20)
         self.declare_parameter('grasp_reach_x_max', 0.45)
         self.declare_parameter('grasp_reach_y', 0.25)
         # grasp_auto=true 时抓取点由"方块 map 位置 + 目标朝向"反解；反解出来
@@ -331,6 +337,7 @@ class TaskOrchestrator(Node):
         self.grasp_x_min = g('grasp_x_min').value
         self.grasp_x_mid = g('grasp_x_mid').value
         self.grasp_park_shortfall = g('grasp_park_shortfall').value
+        self.grasp_park_margin = g('grasp_park_margin').value
         self.grasp_reach_x_max = g('grasp_reach_x_max').value
         self.grasp_reach_y = g('grasp_reach_y').value
         self.grasp_auto_max_fwd = g('grasp_auto_max_fwd').value
@@ -576,6 +583,20 @@ class TaskOrchestrator(Node):
         else:
             gx = self.obs_x + fwd * math.cos(self.obs_yaw)
             gy = self.obs_y + fwd * math.sin(self.obs_yaw)
+
+        # 提前停车：Nav2 只负责粗到位，最后一段交给 _check_grasp_reachable 里的
+        # 蠕动闭环（那里有安全窗口 + 双向微调，比在台子旁边硬啃容差可靠得多）。
+        # 上限取 fwd-0.02，保证目标点仍在观测点前方一点（避免零长度目标）。
+        margin = min(self.grasp_park_margin, max(0.0, fwd - 0.02))
+        if margin > 0.0:
+            ux, uy = gx - self.obs_x, gy - self.obs_y
+            n = math.hypot(ux, uy)
+            if n > 1e-6:
+                gx -= margin * ux / n
+                gy -= margin * uy / n
+                self.get_logger().info(
+                    f'抓取点提前 {margin:.2f}m 停车（Nav2 只做粗到位，'
+                    f'最后 {margin:.2f}m 由 /cmd_vel 蠕动闭环完成）')
         self._send_nav(gx, gy, self.obs_yaw, self.obs_frame,
                        TaskStatus.NAV_TO_GRASP, '导航到抓取点', 'NAV_GRASP')
 
@@ -812,11 +833,15 @@ class TaskOrchestrator(Node):
         else:
             tol = self.grasp_compensate_xy
             if abs(ex) <= tol and abs(ey) <= tol:
-                lvl = 'warn' if err > 0.10 else 'info'
+                # 注意：不能写成 (logger.warn if x else logger.info)(msg) ——
+                # rclpy 的 Logger 按**调用点**缓存 severity，同一行换级别会抛
+                # ValueError: Logger severity cannot be changed between calls。
                 msg = (f'抓取点偏 {err * 1000:.0f} mm（到位姿态漂移）→ '
                        f'本次抓取直接改用实测位置 ({bx:.3f},{by:.3f}) 作为工具目标')
-                (self.get_logger().warn if lvl == 'warn'
-                 else self.get_logger().info)(msg)
+                if err > 0.10:
+                    self.get_logger().warn(msg)
+                else:
+                    self.get_logger().info(msg)
                 self.pick_tool_x, self.pick_tool_y = bx, by
             else:
                 # 顺手算出"要让方块落在抓取点上，参数应该怎么改"，让报错可操作
@@ -1158,8 +1183,14 @@ class TaskOrchestrator(Node):
             return ''
 
     def _sdf_log(self, level, text):
-        getattr(self.get_logger(), level if level in ('warn', 'info', 'debug')
-                else 'info')(text)
+        # 分级写成独立调用：不能用 getattr(logger, level)(text) 动态派发，
+        # 同一调用点换级别会抛 ValueError（见 _check_grasp_reachable 里的说明）。
+        if level == 'warn':
+            self.get_logger().warn(text)
+        elif level == 'debug':
+            self.get_logger().debug(text)
+        else:
+            self.get_logger().info(text)
 
     def _scene_add_tables(self):
         """step①：把静态台子放进碰撞世界 —— 几何从 SDF 读，不在代码里抄。"""

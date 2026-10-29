@@ -85,6 +85,7 @@ def generate_launch_description():
     place_approach_z = LaunchConfiguration('place_approach_z')
     place_down_z = LaunchConfiguration('place_down_z')
     attach_enabled = LaunchConfiguration('attach_enabled')
+    grasp_park_margin = LaunchConfiguration('grasp_park_margin')
     scene_tables = LaunchConfiguration('scene_tables')
     scene_cube = LaunchConfiguration('scene_cube')
     scene_attach = LaunchConfiguration('scene_attach')
@@ -237,6 +238,9 @@ def generate_launch_description():
         #   ③ 抓一次，若会撞方块，下压应变成"路径碰撞"失败；
         #   ④ scene_attach 负责抓起后挂到夹爪；
         #   ⑤ 最后再开 scene_place_table。
+        DeclareLaunchArgument(
+            'grasp_park_margin', default_value='0.20',
+            description='抓取点提前这么多米停车：Nav2 只做粗到位，最后一段用 /cmd_vel 蠕动闭环'),
         DeclareLaunchArgument(
             'scene_tables', default_value='true',
             description='把取件台加进 MoveIt 碰撞世界（第①步）'),
@@ -392,6 +396,7 @@ def generate_launch_description():
             'place_via': place_via,
             'place_via_dist': place_via_dist,
             'attach_enabled': attach_enabled,
+            'grasp_park_margin': grasp_park_margin,
             'scene_tables': scene_tables,
             'scene_cube': scene_cube,
             'scene_attach': scene_attach,
