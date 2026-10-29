@@ -187,6 +187,10 @@ class TaskOrchestrator(Node):
         self.declare_parameter('creep_vel', 0.08)        # 蠕动线速度 m/s
         self.declare_parameter('creep_settle', 0.8)      # 停稳等待 s
         self.declare_parameter('creep_deadband', 0.005)  # 小于它就不动了 m
+        # 蠕动超时上限：闭环按当前 believed 距离判断，不再按时间开环
+        self.declare_parameter('creep_max_time', 6.0)
+        # 蠕动发到哪个话题：留空=自动（有 cmd_vel_nav 订阅者就用它）
+        self.declare_parameter('creep_topic', '')
         # 收起搬运的目标**工具位姿**（不是关节目标）：工具抬到 0.80、收到底盘
         # 正上方 x=0.30，物体 z≈0.74 高于激光面。用笛卡尔直线走过去而不是
         # 用 SRDF 的 carry 关节目标 —— 实测采样规划到 carry 偶尔会耗光预算
@@ -347,6 +351,8 @@ class TaskOrchestrator(Node):
         self.creep_vel = g('creep_vel').value
         self.creep_settle = g('creep_settle').value
         self.creep_deadband = g('creep_deadband').value
+        self.creep_max_time = g('creep_max_time').value
+        self.creep_topic = g('creep_topic').value
         self.grasp_correct_count = 0
         self.creep_start = None       # 微调蠕动开始时刻（None=不在蠕动）
         self.creep_dist = 0.0         # 本次要走的距离（带符号）
@@ -380,6 +386,12 @@ class TaskOrchestrator(Node):
         self.nav_pub = self.create_publisher(NavGoal, '/nav_cmd', 10)
         self.status_pub = self.create_publisher(TaskStatus, '/task_status', 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        # 蠕动专用发布器：nav2_bringup 里 /cmd_vel 的**唯一**发布者是
+        # velocity_smoother（controller_server 发 cmd_vel_nav，smoother 平滑后
+        # 以 /cmd_vel 发出）。我们若也直接发 /cmd_vel，就有两个发布者抢同一
+        # 话题，插件收到的速度被稀释（实测命令 0.08m/s 只走 0.05~0.06）。
+        # 发到 smoother 的输入 cmd_vel_nav，速率才准确。
+        self.cmd_vel_nav_pub = self.create_publisher(Twist, 'cmd_vel_nav', 10)
         # 识别使能：只在识别窗口打开，其余阶段（导航/抓取/搬运/放置）关掉，
         # 省掉每帧最多 12 遍 detectMarkers 的 CPU 开销。
         # 用 transient_local（锁存）保证 detector 晚启动也能收到最后一次状态。
@@ -461,6 +473,17 @@ class TaskOrchestrator(Node):
 
     def _now(self):
         return self.get_clock().now()
+
+    def _creep_publish(self, twist):
+        # 发给速度平滑器的输入，而不是与它抢 /cmd_vel
+        topic = self.creep_topic
+        if not topic:
+            topic = ('cmd_vel_nav'
+                     if self.count_subscribers('cmd_vel_nav') > 0 else '/cmd_vel')
+        if topic.endswith('cmd_vel_nav'):
+            self.cmd_vel_nav_pub.publish(twist)
+        else:
+            self.cmd_vel_pub.publish(twist)
 
     def _pub_empty(self, publisher, what):
         publisher.publish(Empty())
@@ -1126,6 +1149,11 @@ class TaskOrchestrator(Node):
         if world is not None:
             diff.world = world
         if attached is not None:
+            # 【必须】附着物体走 robot_state，而 MoveIt 只接受 is_diff=True 的
+            # RobotState 去修改物体；否则报
+            #   The specified RobotState is not marked as is_diff ... Object is ignored
+            # 然后**静默忽略** —— 表现为 attach 没生效、场景里多出一个方块。
+            diff.robot_state.is_diff = True
             diff.robot_state.attached_collision_objects = attached
         fut = self.scene_cli.call_async(ApplyPlanningScene.Request(scene=diff))
         fut.add_done_callback(lambda f: self._scene_done(f, why))
@@ -1341,19 +1369,26 @@ class TaskOrchestrator(Node):
         if self.stage == 'PICK_CREEP':
             if self.creep_start is not None:
                 elapsed = (now - self.creep_start).nanoseconds / 1e9
-                dur = abs(self.creep_dist) / max(self.creep_vel, 1e-3)
-                if elapsed >= dur:
-                    self.cmd_vel_pub.publish(Twist())       # 停
+                # 【闭环】按当前 believed 的方块距离决定方向和是否停车。
+                # 不用开环时间：底盘实际速度只有命令值的 50~70%（见 _creep_publish
+                # 的说明），开环必然走不够，白烧一次微调机会。
+                cur = self._object_in_base()
+                remain = (cur[0] - self.grasp_x_mid) \
+                    if cur is not None else self.creep_dist
+                if abs(remain) <= self.creep_deadband or elapsed >= self.creep_max_time:
+                    self._creep_publish(Twist())            # 停
                     self.creep_start = None
                     self.creep_settle_until = now + rclpy.duration.Duration(
                         seconds=self.creep_settle)
                     self.get_logger().info(
-                        f'微调蠕动完成（目标 {self.creep_dist * 1000:+.0f} mm，'
-                        f'用时 {elapsed:.1f}s），稳定后重新校验')
+                        f'微调蠕动结束（剩余 {remain * 1000:+.0f} mm，'
+                        f'用时 {elapsed:.1f}s'
+                        f'{"，超时" if elapsed >= self.creep_max_time else ""}）'
+                        f'，稳定后重新校验')
                 else:
                     t = Twist()
-                    t.linear.x = math.copysign(self.creep_vel, self.creep_dist)
-                    self.cmd_vel_pub.publish(t)
+                    t.linear.x = math.copysign(self.creep_vel, remain)
+                    self._creep_publish(t)
             elif self.creep_settle_until is not None and now >= self.creep_settle_until:
                 self.creep_settle_until = None
                 self.stage = 'SETTLE'        # 回到"稳定 → 重新校验"的循环
