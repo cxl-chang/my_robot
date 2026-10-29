@@ -248,6 +248,7 @@ class TaskOrchestrator(Node):
         self.declare_parameter('scene_cube_source', 'truth')
         self.declare_parameter('truth_topic', '/gz_pose_info')
         self.declare_parameter('truth_link', 'red_cube')
+        self.declare_parameter('truth_robot_link', 'my_robot')
         # 真值与参数推算差超过这个值就认为坐标系不一致，退回参数
         self.declare_parameter('truth_max_dev', 0.50)
         # 方块中心离地高度（台面 0.48 + 半高 0.025）
@@ -328,6 +329,7 @@ class TaskOrchestrator(Node):
         self.scene_cube_source = g('scene_cube_source').value
         self.truth_topic = g('truth_topic').value
         self.truth_link = g('truth_link').value
+        self.truth_robot_link = g('truth_robot_link').value
         self.truth_max_dev = g('truth_max_dev').value
         self.object_z = g('object_z').value
         self.scene_world_file = g('scene_world_file').value
@@ -408,6 +410,7 @@ class TaskOrchestrator(Node):
             GetPlanningScene, g('scene_get_service').value)
         # 方块真值（Gazebo /world/<world>/pose/info 桥出的 TFMessage）
         self.truth_cube = None
+        self.truth_robot = None
         self._truth_logged = False
         if self.scene_enable and self.scene_cube_source == 'truth':
             self.truth_sub = self.create_subscription(
@@ -480,6 +483,15 @@ class TaskOrchestrator(Node):
         if not topic:
             topic = ('cmd_vel_nav'
                      if self.count_subscribers('cmd_vel_nav') > 0 else '/cmd_vel')
+        if not getattr(self, '_creep_topic_logged', False):
+            self._creep_topic_logged = True
+            if topic.endswith('cmd_vel_nav'):
+                self.get_logger().info(
+                    '蠕动走 cmd_vel_nav（velocity_smoother 的输入，不抢 /cmd_vel）')
+            else:
+                self.get_logger().warn(
+                    '没找到 cmd_vel_nav 订阅者，蠕动退回 /cmd_vel'
+                    '（若底盘实际速度只有命令的 ~70%，就是这里在跟 smoother 抢）')
         if topic.endswith('cmd_vel_nav'):
             self.cmd_vel_nav_pub.publish(twist)
         else:
@@ -836,11 +848,17 @@ class TaskOrchestrator(Node):
         ex = bx - self.grasp_target_x
         ey = by - self.grasp_target_y
         err = math.hypot(ex, ey)
+        tb = self._truth_object_in_base()
+        truth_txt = ''
+        if tb is not None:
+            # 真值 vs belief 并排：能直接区分"定位误差"和"底盘没走够"
+            truth_txt = (f'｜真值 ({tb[0]:.3f},{tb[1]:.3f})，'
+                         f'差 ({(bx - tb[0]) * 1000:+.0f},{(by - tb[1]) * 1000:+.0f})mm')
         self.get_logger().info(
             f'抓取校验：方块在 base 系 ({bx:.3f},{by:.3f})，抓取目标 '
             f'({self.grasp_target_x:.3f},{self.grasp_target_y:.3f})，偏差 '
             f'{err * 1000:.0f} mm（机器人实际位姿 '
-            f'({rx:.2f},{ry:.2f},{math.degrees(ryaw):.1f}°)）')
+            f'({rx:.2f},{ry:.2f},{math.degrees(ryaw):.1f}°)）{truth_txt}')
 
         # 判据分三档（核心思想：**只要方块实测位置在机械臂够得到的区间里，
         # 就直接按实测位置抓**，不要去比对"名义标定值"——名义值只是用于决定
@@ -1102,17 +1120,31 @@ class TaskOrchestrator(Node):
     # 发现"偶发蹭到方块顶部"。加进去之后这类接触会变成明确的规划失败。
 
     def truth_cb(self, msg):
-        """收 /gz_pose_info（Gazebo 真值），取方块的世界位姿。"""
+        # 收 /gz_pose_info（Gazebo 真值）：方块位姿 + 机器人位姿。
+        # 有了机器人真值，才能算出方块在【真实 base 系】的位置，
+        # 从而把 AMCL/odom 的误差与底盘"实际走没走够"分离。
         for tr in msg.transforms:
-            if tr.child_frame_id.strip('/') == self.truth_link:
-                t = tr.transform.translation
+            name = tr.child_frame_id.strip('/')
+            t = tr.transform.translation
+            q = tr.transform.rotation
+            if name == self.truth_robot_link:
+                self.truth_robot = (t.x, t.y, 2.0 * math.atan2(q.z, q.w))
+            elif name == self.truth_link:
                 self.truth_cube = (t.x, t.y, t.z)
                 if not self._truth_logged:
                     self._truth_logged = True
                     self.get_logger().info(
-                        f'已收到方块真值 /gz_pose_info：{self.truth_link} @ '
+                        f'已收到方块真值 /gz_pose_info：{name} @ '
                         f'({t.x:.3f},{t.y:.3f},{t.z:.3f})')
-                return
+
+    def _truth_object_in_base(self):
+        # 用 Gazebo 真值算方块在【真实】base 系的坐标（不经 AMCL/odom）
+        if self.truth_cube is None or self.truth_robot is None:
+            return None
+        rx, ry, ryaw = self.truth_robot
+        dx, dy = self.truth_cube[0] - rx, self.truth_cube[1] - ry
+        c, s = math.cos(-ryaw), math.sin(-ryaw)
+        return c * dx - s * dy, s * dx + c * dy
 
     def _make_box(self, obj_id, xyz, size, operation=None, quat=None):
         """构造一个 box 碰撞体；REMOVE 时只需要 id。"""
