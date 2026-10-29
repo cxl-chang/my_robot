@@ -965,6 +965,14 @@ x≈0.31，工具离肩关节仅 ≈0.20m（手臂折得很死）。修正后同
   0.48 = 台面，用真实台面高会让**每一次**下压都被判碰撞；压 5mm 后余量 5mm，
   既不误报也不失去防护意义；
 * **方块膨胀 5mm**（`scene_cube_padding`）：吃掉参数/感知误差，避免"擦边"规划；
+* **附着物体必须放在 `robot_state.is_diff = True` 的 diff 里**：否则 MoveIt 报
+  `The specified RobotState is not marked as is_diff ... Object is ignored`
+  然后**静默忽略** —— 表现为 attach 没生效、场景里多出一个方块（实测踩过）；
+* **蠕动指令要发到 velocity_smoother 的输入 `cmd_vel_nav`，不能发 `/cmd_vel`**：
+  nav2_bringup 里 `/cmd_vel` 的唯一发布者是 `velocity_smoother`（controller_server
+  发 `cmd_vel_nav` → smoother 平滑后以 `/cmd_vel` 发出），两个发布者抢同一话题会让
+  底盘实际速度只有命令值的 50~70%（实测 0.08m/s 只走 0.05~0.06）。找 `cmd_vel_nav`
+  订阅者决定话题，蠕动的方向与停车判据也改成**按当前 believed 距离闭环**；
 * **attach 相对位姿 = `grasp_z − object_z` = 0.075m**：方块中心在工具系 +z 方向，
   跟参数联动，不写死；
 * **真值来源**：`gazebo_bridge.yaml` 新增 `/gz_pose_info`（桥
