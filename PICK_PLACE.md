@@ -949,10 +949,17 @@ x≈0.31，工具离肩关节仅 ≈0.20m（手臂折得很死）。修正后同
 | `scene_attach` | true | 抓起后从世界摘掉、挂到 `tool_link`（`touch_links` 放行夹爪） |
 | `scene_place_table` | **false** | 放置台（台面 + 支柱），最后再开 |
 | `scene_cube_source` | `truth` | 方块位姿来源：Gazebo 真值 / 参数 |
+| `scene_world_file` | 空=自动 | 世界文件；空则自动定位 `my_robot_bringup/worlds/test_world.sdf` |
+| `scene_models` | `PickTable,PlaceTable` | 从 SDF 取哪些模型；留空 = 所有静态 box |
 
 关键实现细节：
 
 * **必须 `is_diff = True`**：否则整份覆盖，会把别人加的物体（RViz、octomap）清掉；
+* **台子几何从 SDF 读，不在代码里抄坐标**（`scene_from_sdf.py`）：解析 `<world>`
+  下所有 `static` 模型的 `<box>` 碰撞几何，把 model/link/collision 三层位姿组合起来；
+  `plane` / `mesh` 跳过并计数。白名单默认只取两张台子，留空则连装饰用的
+  `box` / `box_0` 一起加。SDF 读不到就报错并跳过，**不再有手写的兜底坐标**
+  可以悄悄过期；
 * **取件台顶面压低 5mm**（`scene_table_shrink`）：竖直下抓时指尖本来就落到
   0.48 = 台面，用真实台面高会让**每一次**下压都被判碰撞；压 5mm 后余量 5mm，
   既不误报也不失去防护意义；
