@@ -42,7 +42,8 @@ from std_msgs.msg import Bool, Empty
 from geometry_msgs.msg import Pose
 from moveit_msgs.msg import (PlanningScene, PlanningSceneWorld, CollisionObject,
                              AttachedCollisionObject)
-from moveit_msgs.srv import ApplyPlanningScene
+from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
+from moveit_msgs.msg import PlanningSceneComponents
 from shape_msgs.msg import SolidPrimitive
 from tf2_msgs.msg import TFMessage
 from my_robot_interfaces.msg import (
@@ -223,6 +224,9 @@ class TaskOrchestrator(Node):
         self.declare_parameter('scene_cube', True)
         self.declare_parameter('scene_attach', True)
         self.declare_parameter('scene_attach_link', 'tool_link')
+        self.declare_parameter('scene_get_service', '/get_planning_scene')
+        # 每次更新后回读一次场景并打日志（定位“多出来一个方块”这类问题）
+        self.declare_parameter('scene_verbose', True)
         # 方块放进碰撞世界时向外膨胀的量：吃掉参数/感知误差，避免"擦边"规划
         self.declare_parameter('scene_cube_padding', 0.005)
         # 台面顶面压低多少：竖直下抓时指尖本来就要贴到台面(0.48)，用真实台面高
@@ -307,6 +311,7 @@ class TaskOrchestrator(Node):
         self.scene_cube_on = bool(g('scene_cube').value)
         self.scene_attach_on = bool(g('scene_attach').value)
         self.scene_attach_link = g('scene_attach_link').value
+        self.scene_verbose = bool(g('scene_verbose').value)
         self.scene_cube_padding = g('scene_cube_padding').value
         self.scene_table_shrink = g('scene_table_shrink').value
         self.scene_cube_source = g('scene_cube_source').value
@@ -383,6 +388,8 @@ class TaskOrchestrator(Node):
         # 规划场景服务（加/删碰撞体、attach/detach 都走它，diff 增量）
         self.scene_cli = self.create_client(
             ApplyPlanningScene, g('scene_apply_service').value)
+        self.scene_get_cli = self.create_client(
+            GetPlanningScene, g('scene_get_service').value)
         # 方块真值（Gazebo /world/<world>/pose/info 桥出的 TFMessage）
         self.truth_cube = None
         self._truth_logged = False
@@ -1105,8 +1112,37 @@ class TaskOrchestrator(Node):
             return
         if ok:
             self.get_logger().info(f'规划场景已更新（{why}）')
+            if self.scene_verbose:
+                self._scene_dump(why)
         else:
             self.get_logger().warn(f'规划场景更新被拒绝（{why}）')
+
+    def _scene_dump(self, tag):
+        """回读一次规划场景，打印 world / attached 里到底有什么。"""
+        if not self.scene_get_cli.service_is_ready():
+            return
+        req = GetPlanningScene.Request()
+        req.components.components = (
+            PlanningSceneComponents.WORLD_OBJECT_GEOMETRY
+            | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS)
+        fut = self.scene_get_cli.call_async(req)
+        fut.add_done_callback(lambda f: self._scene_dump_done(f, tag))
+
+    def _scene_dump_done(self, fut, tag):
+        try:
+            sc = fut.result().scene
+        except Exception as e:      # noqa: BLE001
+            self.get_logger().warn(f'规划场景查询失败（{tag}）: {e}')
+            return
+        world = [o.id for o in sc.world.collision_objects]
+        att = [f'{a.object.id}@{a.link_name}'
+               for a in sc.robot_state.attached_collision_objects]
+        self.get_logger().info(f'规划场景[{tag}] world={world} attached={att}')
+        # 自愈：挂到夹爪之后，世界里不应该还留着同名方块
+        if tag == '方块挂到夹爪' and self.scene_attach_on and 'red_cube' in world:
+            self.get_logger().warn(
+                'attach 后世界里的 red_cube 没被移除，补发一次删除')
+            self._scene_set_cube(None)
 
     def _scene_add_tables(self):
         """step①：任务开始时把静态台子放进碰撞世界。"""
@@ -1182,6 +1218,9 @@ class TaskOrchestrator(Node):
         aco.link_name = self.scene_attach_link
         aco.object = self._make_box('red_cube', (0.0, 0.0, dz),
                                     (0.05, 0.05, 0.05))
+        # 附着物体的位姿是**相对 link_name** 的，frame_id 必须写这个 link
+        # （写 map 时 MoveIt 会按 map->link 去换算，方块会被扔到别处）
+        aco.object.header.frame_id = self.scene_attach_link
         aco.touch_links = [self.scene_attach_link, 'gripper_base_link',
                            'gripper_left_finger_link',
                            'gripper_right_finger_link', 'hand_link']
