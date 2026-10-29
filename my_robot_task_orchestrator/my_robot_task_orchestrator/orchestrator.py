@@ -1138,10 +1138,16 @@ class TaskOrchestrator(Node):
                         f'({t.x:.3f},{t.y:.3f},{t.z:.3f})')
 
     def _truth_object_in_base(self):
-        # 用 Gazebo 真值算方块在【真实】base 系的坐标（不经 AMCL/odom）
+        # 用 Gazebo 真值算方块在【真实 base_link 系】的坐标（不经 AMCL/odom）。
+        # 注意坐标系：Gazebo 的模型原点 = URDF 根 = base_footlink（差速转心），
+        # 而 belief（_map_pose）最后一步是 _to_base_link ⇒ 前移了 base_axle_offset。
+        # 不补这个 0.15m，真值就会比 belief 恒定大 0.15m（实测差 -150mm 常数）。
         if self.truth_cube is None or self.truth_robot is None:
             return None
         rx, ry, ryaw = self.truth_robot
+        off = self.base_axle_offset
+        rx += off * math.cos(ryaw)
+        ry += off * math.sin(ryaw)
         dx, dy = self.truth_cube[0] - rx, self.truth_cube[1] - ry
         c, s = math.cos(-ryaw), math.sin(-ryaw)
         return c * dx - s * dy, s * dx + c * dy
