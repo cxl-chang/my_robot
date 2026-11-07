@@ -251,8 +251,8 @@ def generate_launch_description():
             'scene_attach', default_value='true',
             description='抓起后把方块从世界摘掉、挂到夹爪（第④步）'),
         DeclareLaunchArgument(
-            'scene_place_table', default_value='false',
-            description='把放置台也加进碰撞世界（第⑤步，默认关）'),
+            'scene_place_table', default_value='true',
+            description='把放置台也加进碰撞世界（第⑤步）'),
         DeclareLaunchArgument(
             'scene_cube_source', default_value='truth',
             description='方块位姿来源：truth=Gazebo 真值 /gz_pose_info，'

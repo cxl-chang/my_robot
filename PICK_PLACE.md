@@ -948,7 +948,8 @@ x≈0.31，工具离肩关节仅 ≈0.20m（手臂折得很死）。修正后同
 | `scene_tables` | true | 任务开始时加取件台（验证 diff 通路） |
 | `scene_cube` | true | 识别成功后按方块位姿加方块 |
 | `scene_attach` | true | 抓起后从世界摘掉、挂到 `tool_link`（`touch_links` 放行夹爪） |
-| `scene_place_table` | **false** | 放置台（台面 + 支柱），最后再开 |
+| `scene_place_table` | true | 放置台（台面 + 支柱） |
+| `scene_acm_enable` | true | ACM 放行：台面/支柱 × 夹爪连杆、台面 × 方块 |
 | `scene_cube_source` | `truth` | 方块位姿来源：Gazebo 真值 / 参数 |
 | `scene_world_file` | 空=自动 | 世界文件；空则自动定位 `my_robot_bringup/worlds/test_world.sdf` |
 | `scene_models` | `PickTable,PlaceTable` | 从 SDF 取哪些模型；留空 = 所有静态 box |
@@ -964,6 +965,11 @@ x≈0.31，工具离肩关节仅 ≈0.20m（手臂折得很死）。修正后同
 * **取件台顶面压低 5mm**（`scene_table_shrink`）：竖直下抓时指尖本来就落到
   0.48 = 台面，用真实台面高会让**每一次**下压都被判碰撞；压 5mm 后余量 5mm，
   既不误报也不失去防护意义；
+* **ACM 必须放行两组接触**（`scene_acm_links` 可配）：①`gripper_*`/`hand_link`
+  × 台面与支柱 —— 否则竖直下抓的指尖、下放时的夹爪擦台面都被判碰撞；
+  ②`red_cube` × 台面与支柱 —— 否则抓起后（**附着物体**的碰撞仍会检查）
+  放下时方块压到台面就判碰撞，放置走不完。ACM 是全量方阵，代码里是
+  "读全量 → 补名字 → 对称写 → 整体回写"，自碰条目不丢（实测 15 对）。
 * **方块膨胀 5mm**（`scene_cube_padding`）：吃掉参数/感知误差，避免"擦边"规划；
 * **附着物体必须放在 `robot_state.is_diff = True` 的 diff 里**：否则 MoveIt 报
   `The specified RobotState is not marked as is_diff ... Object is ignored`

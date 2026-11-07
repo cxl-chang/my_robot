@@ -44,7 +44,7 @@ from geometry_msgs.msg import Pose
 from moveit_msgs.msg import (PlanningScene, PlanningSceneWorld, CollisionObject,
                              AttachedCollisionObject)
 from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
-from moveit_msgs.msg import PlanningSceneComponents
+from moveit_msgs.msg import PlanningSceneComponents, AllowedCollisionEntry
 from shape_msgs.msg import SolidPrimitive
 from tf2_msgs.msg import TFMessage
 from my_robot_interfaces.msg import (
@@ -232,7 +232,7 @@ class TaskOrchestrator(Node):
         self.declare_parameter('scene_frame', 'map')
         self.declare_parameter('scene_apply_service', '/apply_planning_scene')
         self.declare_parameter('scene_tables', True)
-        self.declare_parameter('scene_place_table', False)
+        self.declare_parameter('scene_place_table', True)
         self.declare_parameter('scene_cube', True)
         self.declare_parameter('scene_attach', True)
         self.declare_parameter('scene_attach_link', 'tool_link')
@@ -260,6 +260,11 @@ class TaskOrchestrator(Node):
         self.declare_parameter('scene_world_file', '')
         # 白名单（逗号分隔）；留空 = 所有静态 box 都加（含装饰用的 box/box_0）
         self.declare_parameter('scene_models', 'PickTable,PlaceTable')
+        # ACM（允许碰撞矩阵）放行：台面/支柱 ↔ 夹爪各连杆、方块 ↔ 台面。
+        # 不放行的话：①下放时指尖擦台面被判碰撞；②抓起后（附着）的方块
+        # 落到台面上被判碰撞 —— 放置根本走不完。
+        self.declare_parameter('scene_acm_enable', True)
+        self.declare_parameter('scene_acm_links', 'gripper_base_link,gripper_left_finger_link,gripper_right_finger_link,hand_link')
 
         # --- 吸附（DetachableJoint，仿真专用）---
         self.declare_parameter('attach_enabled', False)
@@ -334,6 +339,11 @@ class TaskOrchestrator(Node):
         self.object_z = g('object_z').value
         self.scene_world_file = g('scene_world_file').value
         self.scene_models = g('scene_models').value
+        self.scene_acm_enable = bool(g('scene_acm_enable').value)
+        self.scene_acm_links = [x.strip() for x in
+                                g('scene_acm_links').value.split(',') if x.strip()]
+        self.scene_table_ids = []      # 已加入场景的台子物体名
+        self.scene_place_top_z = None  # 放置台台面高度（来自 SDF 解析）
         # --- 抓取可达性校验（防"空抓+假吸附"，详见 _check_grasp_reachable）---
         self.object_x = g('object_x').value     # 方块世界坐标（map 系）
         self.object_y = g('object_y').value
@@ -1175,7 +1185,7 @@ class TaskOrchestrator(Node):
         co.operation = operation
         return co
 
-    def _apply_scene(self, world=None, attached=None, why=''):
+    def _apply_scene(self, world=None, attached=None, acm=None, why=''):
         """把一份**增量**场景发给 /apply_planning_scene。"""
         if not self.scene_enable:
             return
@@ -1186,6 +1196,9 @@ class TaskOrchestrator(Node):
         diff.is_diff = True       # 必须增量，否则会把别人加的场景整份清空
         if world is not None:
             diff.world = world
+        if acm is not None:
+            # ACM 是**全量方阵**，这里要写整份（读-改-回写，见 _scene_apply_acm）
+            diff.allowed_collision_matrix = acm
         if attached is not None:
             # 【必须】附着物体走 robot_state，而 MoveIt 只接受 is_diff=True 的
             # RobotState 去修改物体；否则报
@@ -1208,6 +1221,62 @@ class TaskOrchestrator(Node):
                 self._scene_dump(why)
         else:
             self.get_logger().warn(f'规划场景更新被拒绝（{why}）')
+
+    @staticmethod
+    def _acm_set_pair(acm, a, b):
+        # AllowedCollisionMatrix 是**全量方阵**：新名字要把每行补齐、对称写、
+        # 然后整份回写（它不是增量结构）。
+        names = list(acm.entry_names)
+        changed = False
+        for n in (a, b):
+            if n not in names:
+                names.append(n)
+                for row in acm.entry_values:
+                    row.enabled.append(False)
+                acm.entry_values.append(AllowedCollisionEntry(
+                    enabled=[False] * len(names)))
+                changed = True
+        ia, ib = names.index(a), names.index(b)
+        if not acm.entry_values[ia].enabled[ib] or not acm.entry_values[ib].enabled[ia]:
+            acm.entry_values[ia].enabled[ib] = True
+            acm.entry_values[ib].enabled[ia] = True
+            changed = True
+        acm.entry_names = names
+        return changed
+
+    def _scene_apply_acm(self, table_ids):
+        """读全量 ACM → 放行（台子 × 夹爪连杆）与（台子 × 方块）→ 回写。"""
+        if not (self.scene_enable and self.scene_acm_enable):
+            return
+        if not table_ids:
+            return
+        req = GetPlanningScene.Request()
+        req.components.components = PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+        fut = self.scene_get_cli.call_async(req)
+        fut.add_done_callback(lambda f: self._scene_apply_acm_done(f, table_ids))
+
+    def _scene_apply_acm_done(self, fut, table_ids):
+        try:
+            acm = fut.result().scene.allowed_collision_matrix
+        except Exception as e:      # noqa: BLE001
+            self.get_logger().warn(f'读 ACM 失败，跳过放行: {e}')
+            return
+        pairs = []
+        for tid in table_ids:
+            for link in self.scene_acm_links:
+                pairs.append((link, tid))
+            pairs.append(('red_cube', tid))
+        changed = 0
+        for a, b in pairs:
+            if self._acm_set_pair(acm, a, b):
+                changed += 1
+        if not changed:
+            self.get_logger().info('ACM 放行项已存在，无需重复写入')
+            return
+        self._apply_scene(acm=acm, why='ACM 放行台面接触')
+        self.get_logger().info(
+            f'ACM 放行 {changed} 对：{sorted({t for _l, t in pairs})} × '
+            f'{[l for l in self.scene_acm_links] + ["red_cube"]}')
 
     def _scene_dump(self, tag):
         """回读一次规划场景，打印 world / attached 里到底有什么。"""
@@ -1280,6 +1349,13 @@ class TaskOrchestrator(Node):
                 for obj_id, xyz, quat, size in boxes]
         self._apply_scene(world=PlanningSceneWorld(collision_objects=objs),
                           why='加入台子')
+        self.scene_table_ids = [bid for bid, _x, _q, _s in boxes]
+        place_tops = [xyz[2] + size[2] / 2.0 for bid, xyz, _q, size in boxes
+                      if 'Place' in bid and 'top' in bid]
+        if place_tops:
+            self.scene_place_top_z = max(place_tops)
+        # 台面/支柱 vs 夹爪、vs 方块：不放行的话下放和放置都会被判碰撞
+        self._scene_apply_acm(self.scene_table_ids)
         tops = ', '.join(f'{bid}(顶面{xyz[2] + size[2] / 2.0:.3f})'
                          for bid, xyz, _q, size in boxes)
         self.get_logger().info(
@@ -1348,7 +1424,7 @@ class TaskOrchestrator(Node):
             attached=[aco], why='方块挂到夹爪')
 
     def _scene_detach_cube(self):
-        """放置脱开后：MoveIt 侧也摘掉（世界位姿等下轮识别重新加）。"""
+        """放置脱开后：MoveIt 侧摘掉附着物体，并按放置位姿加回世界（可视化）。"""
         if not (self.scene_enable and self.scene_attach_on):
             return
         aco = AttachedCollisionObject()
@@ -1356,7 +1432,16 @@ class TaskOrchestrator(Node):
         aco.object = self._make_box('red_cube', (0, 0, 0), (0, 0, 0),
                                     CollisionObject.REMOVE)
         self._apply_scene(attached=[aco], why='方块脱离夹爪')
-        self._scene_set_cube(None)
+        # 放回世界：位置 = 任务的放置点，高度 = 放置台面 + 方块半高
+        if (self.task is not None and self.scene_place_top_z is not None
+                and self.scene_cube_on):
+            z = self.scene_place_top_z + 0.025
+            self._scene_set_cube((self.task.place_x, self.task.place_y, z))
+            self.get_logger().info(
+                f'方块按放置位姿加回碰撞世界：'
+                f'({self.task.place_x:.3f},{self.task.place_y:.3f},{z:.3f})')
+        else:
+            self._scene_set_cube(None)
 
     def _scene_cleanup(self):
         """任务结束/失败：把方块从场景里清掉，避免影响下一次任务。"""
