@@ -204,6 +204,40 @@ ros2 run my_robot_perception aruco_detector
 ros2 launch my_robot_commander_cpp commander.launch.py       # 手臂/夹爪（必须用 launch）
 ```
 
+## 怎么看调试日志（屏幕会被刷掉）
+
+ROS 2 的日志分三处，**位置和命名都反直觉**，先记住这张表：
+
+| 内容 | 位置 | 备注 |
+|---|---|---|
+| **编排器日志**（所有关键决策） | `~/.ros/log/`**`python3_<pid>_<时间戳>.log`** | Python 节点以**解释器**命名，不叫 `task_orchestrator_*.log` |
+| 其它节点日志 | `~/.ros/log/<节点名>_<pid>_<时间戳>.log` | `my_robot_commander_*`、`nav_commander_*`、nav2 各节点 |
+| launch 级信息 | `~/.ros/log/<时间戳>-<主机>-<pid>/launch.log` | **只有**进程启停/参数报错，**不含节点输出** |
+
+但按节点切分丢掉了跨节点时序，而调试最需要“MoveIt 报碰撞那一刻编排器在干什么”，
+所以推荐**把控制台灌到文件**：
+
+```bash
+tools/run_demo.sh                              # 跑 demo + 存档 + 收尾自动汇总
+tools/run_demo.sh localization_mode:=slam      # 需要加参数就照常传
+```
+
+- 全量日志：`~/demo_logs/run_<时间戳>.log`（真实交织顺序）
+- 结束时自动打印关键里程碑（视觉中值/抓取校验/蠕动/下压/吸附/放置/任务失败/路径碰撞…）最后 60 条
+- 也可以手工：`ros2 launch ... 2>&1 | tee ~/demo_run.log`
+
+事后速查：
+
+```bash
+tools/demo_logs.sh where                     # 最近一次 run 的目录、编排器日志、最近改动过的节点日志
+tools/demo_logs.sh tail 60                   # 编排器日志末 60 行
+tools/demo_logs.sh grep "抓取校验|视觉位姿" 30   # 最近 30 分钟内所有节点日志里搜
+tools/demo_logs.sh run 21-17-39              # 按时间戳片段定位某次 run
+```
+
+其它：`export ROS_LOG_DIR=/tmp/roslog` 可改存储位置；`--log-level debug` 加详细度
+（只加某节点：`--ros-args --log-level my_robot_commander:=debug`）。
+
 ## 已知问题
 
 - **`ROS_LOG_DIR` 不可写会导致 launch 直接报错**：`launch` 会往 `~/.ros/log`
