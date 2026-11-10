@@ -90,7 +90,14 @@ class ArucoDetector(Node):
         # 机器人做任务时是静止观测，5Hz 完全够用。
         # 设为 0 表示不限频（恢复原来的"每帧都处理"行为）。
         self.declare_parameter('max_rate_hz', 5.0)
+        # 标签贴在方块的 -x 面上（贴片中心距方块中心 0.026m，见 test_world.sdf）。
+        # 发布位姿的语义统一为**物体中心**（不是标签面中心）：上层抓取几何和
+        # 后续换成 YOLO（框+台面反投影直接给中心）就都一致了。
+        self.declare_parameter('marker_inset', 0.026)
+        self.declare_parameter('publish_center', True)
         max_rate = float(self.get_parameter('max_rate_hz').value)
+        self.marker_inset = float(self.get_parameter('marker_inset').value)
+        self.publish_center = bool(self.get_parameter('publish_center').value)
         self._min_period_ns = 0 if max_rate <= 0 else int(1e9 / max_rate)
         self._last_proc_ns = 0
         self.skipped_count = 0
@@ -282,9 +289,19 @@ class ArucoDetector(Node):
 
             pose = PoseStamped()
             pose.header = msg.header  # frame_id = camera_link_optical
-            pose.pose.position.x = float(tvec[0])
-            pose.pose.position.y = float(tvec[1])
-            pose.pose.position.z = float(tvec[2])
+            if self.publish_center:
+                # 标签系 +z 指向相机侧（ArUco 约定），方块中心在标签面中心沿 -z
+                # 方向 marker_inset 处 ⇒ p_center = tvec - inset * R[:,2]。
+                # 不扣这 26mm，抓取点会系统性偏近一截。
+                ins = self.marker_inset
+                cx = float(tvec[0] - ins * R[0, 2])
+                cy = float(tvec[1] - ins * R[1, 2])
+                cz = float(tvec[2] - ins * R[2, 2])
+            else:
+                cx, cy, cz = float(tvec[0]), float(tvec[1]), float(tvec[2])
+            pose.pose.position.x = cx
+            pose.pose.position.y = cy
+            pose.pose.position.z = cz
             pose.pose.orientation.x = qx
             pose.pose.orientation.y = qy
             pose.pose.orientation.z = qz
@@ -313,7 +330,8 @@ class ArucoDetector(Node):
                 sub_cnt = -1
             self.get_logger().info(
                 f"检测到 marker {marker_id} ({det.class_id}) | "
-                f"位姿=({tvec[0]:.3f},{tvec[1]:.3f},{tvec[2]:.3f}) | "
+                f"物体中心=({cx:.3f},{cy:.3f},{cz:.3f})"
+                f"(标签面 z={tvec[2]:.3f}, 内缩 {self.marker_inset:.3f}) | "
                 f"像素框 {bbox[2]}x{bbox[3]}px @ ({bbox[0] + bbox[2] // 2},"
                 f"{bbox[1] + bbox[3] // 2}) | scale={used_scale} "
                 f"{used_label} | 订阅者数={sub_cnt}")

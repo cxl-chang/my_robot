@@ -47,6 +47,7 @@ from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
 from moveit_msgs.msg import PlanningSceneComponents, AllowedCollisionEntry
 from shape_msgs.msg import SolidPrimitive
 from tf2_msgs.msg import TFMessage
+from tf2_ros import Buffer, TransformListener
 from my_robot_interfaces.msg import (
     TaskCommand, TaskStatus, NavGoal, NavStatus, ObjectDetection)
 from my_robot_interfaces.action import ArmTask
@@ -86,6 +87,11 @@ class TaskOrchestrator(Node):
         self.declare_parameter('obs_frame', 'map')
         # --- 识别与对准 ---
         self.declare_parameter('detect_timeout', 5.0)
+        # 多帧取中值：识别阶段收到的前几帧里偶尔会有一帧 PnP 跳变
+        # （实测同一次任务里出现过 173mm 的单帧离群，下一轮又回到 9mm）。
+        # 所以不拿第一帧就用，攒够 det_collect_n 帧或等满 det_collect_time 后取中值。
+        self.declare_parameter('det_collect_n', 3)
+        self.declare_parameter('det_collect_time', 0.6)
         # 导航栈坐标系与机械臂坐标系之间差多少（详见 _to_nav_frame/_to_base_link）：
         # 驱动轮在 base_link 后方 base_length/4=0.15m，差速转心=轮轴中点，
         # URDF 把根坐标系 base_footlink（= Nav2 的 robot_base_frame）放在转心上。
@@ -127,6 +133,15 @@ class TaskOrchestrator(Node):
         # 表现为"手臂离方块很远却显示已抓取"。所以动手前先算一遍：
         self.declare_parameter('object_x', 2.8)   # 方块世界坐标（map 系）
         self.declare_parameter('object_y', 3.0)
+        # --- M14：用视觉位姿替换 object_x/object_y ---
+        # 检测节点发布的 pose 语义是**物体中心、相机光学系**（ArUco 已扣掉
+        # 贴片内缩；以后换 YOLO 用框+台面反投影，同样是中心），这里用图像
+        # 时间戳的 TF 把它换到 map 系，作为抓取几何的唯一来源。
+        self.declare_parameter('vision_enable', True)
+        self.declare_parameter('vision_frame', 'map')
+        self.declare_parameter('vision_tf_timeout', 0.2)   # TF 等待上限 s
+        # 视觉位置与参数位置差超过这个值就认为测歪了，退回参数
+        self.declare_parameter('vision_max_dev', 1.0)
         self.declare_parameter('grasp_tol', 0.03)          # 偏差≤此值用名义目标
         # 偏差在 (grasp_tol, grasp_compensate_xy] 内时**直接改用实测位置**当 IK 目标。
         # 取 0.30 而不是 0.08：到位姿态漂移十几度就能让横向坐标差 0.15~0.20 m，
@@ -279,6 +294,8 @@ class TaskOrchestrator(Node):
         self.obs_yaw = g('obs_yaw').value
         self.obs_frame = g('obs_frame').value
         self.detect_timeout = g('detect_timeout').value
+        self.det_collect_n = int(g('det_collect_n').value)
+        self.det_collect_time = g('det_collect_time').value
         self.base_axle_offset = g('base_axle_offset').value
         self.max_retry = g('max_retry').value
         self.align_vel = g('align_vel').value
@@ -337,6 +354,10 @@ class TaskOrchestrator(Node):
         self.truth_robot_link = g('truth_robot_link').value
         self.truth_max_dev = g('truth_max_dev').value
         self.object_z = g('object_z').value
+        self.vision_enable = bool(g('vision_enable').value)
+        self.vision_frame = g('vision_frame').value
+        self.vision_tf_timeout = g('vision_tf_timeout').value
+        self.vision_max_dev = g('vision_max_dev').value
         self.scene_world_file = g('scene_world_file').value
         self.scene_models = g('scene_models').value
         self.scene_acm_enable = bool(g('scene_acm_enable').value)
@@ -413,6 +434,8 @@ class TaskOrchestrator(Node):
         self.attach_pub = self.create_publisher(Empty, self.attach_topic, 10)
         self.detach_pub = self.create_publisher(Empty, self.detach_topic, 10)
         self.arm_client = ActionClient(self, ArmTask, '/arm_task')
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         # 规划场景服务（加/删碰撞体、attach/detach 都走它，diff 增量）
         self.scene_cli = self.create_client(
             ApplyPlanningScene, g('scene_apply_service').value)
@@ -421,6 +444,13 @@ class TaskOrchestrator(Node):
         # 方块真值（Gazebo /world/<world>/pose/info 桥出的 TFMessage）
         self.truth_cube = None
         self.truth_robot = None
+        # 视觉测得、已换算到 map 系的物体位置（None=本轮还没测到）
+        self.obj_map_xy = None
+        self.vision_logged = False
+        self.det_samples = None      # 识别阶段攒样本 [(map_xy, base_xyz)]
+        self.det_frame = ''
+        self.det_collect_deadline = None
+        self.cube_in_scene = False   # 方块是否已在碰撞世界里（避免无用 REMOVE）
         self._truth_logged = False
         if self.scene_enable and self.scene_cube_source == 'truth':
             self.truth_sub = self.create_subscription(
@@ -525,6 +555,8 @@ class TaskOrchestrator(Node):
             f'收到任务：抓取 {msg.object_id} → 放置 '
             f'({msg.place_x:.2f},{msg.place_y:.2f}) '
             f'yaw={msg.place_yaw:.2f} frame={msg.place_frame_id}')
+        self.obj_map_xy = None            # 每轮重新测量
+        self.vision_logged = False
         self._scene_add_tables()
         self._scene_set_cube(None)      # 清掉上一轮可能残留的方块
         self._nav_to_object()
@@ -605,8 +637,9 @@ class TaskOrchestrator(Node):
         fwd = self.grasp_forward
         if self.grasp_auto:
             c, s = math.cos(self.obs_yaw), math.sin(self.obs_yaw)
-            gx = self.object_x - (self.tool_x * c - self.tool_y * s)
-            gy = self.object_y - (self.tool_x * s + self.tool_y * c)
+            ox, oy = self._obj_xy()
+            gx = ox - (self.tool_x * c - self.tool_y * s)
+            gy = oy - (self.tool_x * s + self.tool_y * c)
             self.grasp_target_x = self.tool_x
             self.grasp_target_y = self.tool_y
             fwd = math.hypot(gx - self.obs_x, gy - self.obs_y)
@@ -621,7 +654,7 @@ class TaskOrchestrator(Node):
                 gy = self.obs_y + fwd * math.sin(self.obs_yaw)
             else:
                 self.get_logger().info(
-                    f'抓取点由方块 ({self.object_x},{self.object_y}) 反解：'
+                    f'抓取点由方块 ({ox:.3f},{oy:.3f}) 反解：'
                     f'base_link 停在 ({gx:.2f},{gy:.2f})（离观测点 {fwd:.2f}m），'
                     f'届时方块应落在 base 系 '
                     f'({self.grasp_target_x:.3f},{self.grasp_target_y:.3f})')
@@ -645,13 +678,59 @@ class TaskOrchestrator(Node):
         self._send_nav(gx, gy, self.obs_yaw, self.obs_frame,
                        TaskStatus.NAV_TO_GRASP, '导航到抓取点', 'NAV_GRASP')
 
+    def _transform_point(self, pose_msg, target):
+        """把相机光学系的点变换到 target 系，返回 (x, y, z)；失败 None。"""
+        frame = pose_msg.header.frame_id or 'camera_link_optical'
+        stamp = pose_msg.header.stamp
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                target, frame, stamp,
+                rclpy.duration.Duration(seconds=self.vision_tf_timeout))
+        except Exception as e:      # noqa: BLE001
+            # 时间戳取不到时退一步用最新 TF：物体静止、机器人也已停稳，
+            # 差别只来自这段时间的移动（抓取阶段是毫米级）。
+            try:
+                tf = self.tf_buffer.lookup_transform(target, frame,
+                                                    rclpy.time.Time())
+                self.get_logger().warn(f'{frame}→{target} 用时间戳查询失败'
+                                       f'（{e}），已改用最新 TF')
+            except Exception as e2:  # noqa: BLE001
+                self.get_logger().warn(f'视觉位姿 TF 失败：{frame}→{target}（{e2}）')
+                return None
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        px = pose_msg.pose.position.x
+        py = pose_msg.pose.position.y
+        pz = pose_msg.pose.position.z
+        # q * p 的标准展开（避免额外依赖 tf2_geometry_msgs）
+        x, y, z, w = q.x, q.y, q.z, q.w
+        rx = (1 - 2 * (y * y + z * z)) * px + 2 * (x * y - z * w) * py \
+            + 2 * (x * z + y * w) * pz
+        ry = 2 * (x * y + z * w) * px + (1 - 2 * (x * x + z * z)) * py \
+            + 2 * (y * z - x * w) * pz
+        rz = 2 * (x * z - y * w) * px + 2 * (y * z + x * w) * py \
+            + (1 - 2 * (x * x + y * y)) * pz
+        return t.x + rx, t.y + ry, t.z + rz
+
+    def _vision_map_xy(self, pose_msg):
+        """把检测到的物体中心（相机光学系）换算到 map 系。失败返回 None。"""
+        p = self._transform_point(pose_msg, self.vision_frame)
+        return None if p is None else (p[0], p[1])
+
+    def _obj_xy(self):
+        """抓取几何用的方块世界坐标：视觉优先，没测到才退回参数。"""
+        if self.obj_map_xy is not None:
+            return self.obj_map_xy
+        return (self.object_x, self.object_y)
+
     def _object_in_base(self):
         """方块在当前机器人 base 系下的位置 (x, y, 距离)；拿不到位姿返回 None。"""
         pose = self._map_pose()
         if pose is None:
             return None
         rx, ry, ryaw = pose
-        dx, dy = self.object_x - rx, self.object_y - ry
+        ox, oy = self._obj_xy()
+        dx, dy = ox - rx, oy - ry
         c, s = math.cos(-ryaw), math.sin(-ryaw)
         bx = c * dx - s * dy
         by = s * dx + c * dy
@@ -771,13 +850,100 @@ class TaskOrchestrator(Node):
         if (self.stage == 'DETECT' and self.phase == '识别中'
                 and msg.class_id == self.target_class):
             self.object_pose = msg.pose
+            # 攒样本：不拿第一帧就抓（见 det_collect_n 的说明）
+            if self.det_samples is None:
+                self.det_samples = []
+                # 注意：ObjectDetection 本身没有 header，帧名在 pose(PoseStamped) 里
+                self.det_frame = msg.pose.header.frame_id
+                self.det_collect_deadline = self._now() + rclpy.duration.Duration(
+                    seconds=self.det_collect_time)
+            xy = self._vision_map_xy(msg.pose) if self.vision_enable else None
+            pb = (self._transform_point(msg.pose, 'base_link')
+                  if self.vision_enable else None)
+            self.det_samples.append((xy, pb))
             self.get_logger().info(
-                f'识别到 {msg.class_id}，位姿(camera 系)='
-                f'({msg.pose.pose.position.x:.3f},{msg.pose.pose.position.y:.3f},'
+                f'识别到 {msg.class_id}（第 {len(self.det_samples)} 帧），'
+                f'位姿(camera 系)=({msg.pose.pose.position.x:.3f},'
+                f'{msg.pose.pose.position.y:.3f},'
                 f'{msg.pose.pose.position.z:.3f})')
-            self._set_detect(False, '已识别到目标，抓取及之后不再需要')
-            self._scene_cube_on_detect()
-            self._begin_pick()
+            if (len(self.det_samples) >= self.det_collect_n
+                    or (self.det_collect_deadline is not None
+                        and self._now() >= self.det_collect_deadline)):
+                self._finish_detect()
+
+    @staticmethod
+    def _median_xy(samples, idx):
+        vals = [s[idx] for s in samples if s[idx] is not None]
+        if not vals:
+            return None
+        xs = sorted(v[0] for v in vals)
+        ys = sorted(v[1] for v in vals)
+        return (xs[len(xs) // 2], ys[len(ys) // 2])
+
+    def _finish_detect(self):
+        """样本攒够了：取中值作为视觉结果，然后进入抓取。"""
+        samples = self.det_samples or []
+        self.det_samples = None
+        self.det_collect_deadline = None
+        xy = self._median_xy(samples, 0)
+        pb = self._median_xy(samples, 1)
+        self._set_detect(False, '已识别到目标，抓取及之后不再需要')
+        if xy is None:
+            self.get_logger().warn('视觉位姿不可用（TF 全部失败），退回参数')
+        else:
+            self.get_logger().info(
+                f'视觉中值（{len(samples)} 帧）：map ({xy[0]:.3f},{xy[1]:.3f})')
+            self._apply_vision_xy(xy, pb, frame=self.det_frame)
+        self._scene_cube_on_detect()
+        self._begin_pick()
+
+    def _use_vision_pose(self, pose_msg):
+        """M14：把视觉测到的物体中心换成 map 坐标，作为本轮抓取几何的来源。"""
+        if not self.vision_enable:
+            return
+        xy = self._vision_map_xy(pose_msg)
+        if xy is None:
+            self.get_logger().warn('视觉位姿不可用，抓取几何退回 object_x/object_y')
+            return
+        self._apply_vision_xy(xy, self._transform_point(pose_msg, 'base_link'),
+                              frame=pose_msg.header.frame_id)
+
+    def _apply_vision_xy(self, xy, pb=None, frame=None):
+        """校验并采纳一个已经算好的 map 位置（多帧中值路径也走这里）。"""
+        dev = math.hypot(xy[0] - self.object_x, xy[1] - self.object_y)
+        if dev > self.vision_max_dev:
+            self.get_logger().warn(
+                f'视觉位置 ({xy[0]:.3f},{xy[1]:.3f}) 与参数 '
+                f'({self.object_x:.3f},{self.object_y:.3f}) 差 {dev:.2f}m > '
+                f'{self.vision_max_dev:.2f}m，疑似测歪，退回参数')
+            return
+        self.obj_map_xy = xy
+        self.get_logger().info(
+            f'视觉位姿 → map ({xy[0]:.3f},{xy[1]:.3f})'
+            f'｜参数 ({self.object_x:.3f},{self.object_y:.3f}) '
+            f'差 {dev * 1000:.0f}mm｜frame={frame or "(未知)"}')
+        # 【关键诊断】map 系位置会被 AMCL 位姿误差污染，但抓取几何用的是 base 系，
+        # 那个误差会被同一份 AMCL 位姿抵消。所以这里再直接比一次 base 系：
+        #   视觉 base 系 vs 真值 base 系  → 抓取真正吃到的误差
+        # 同时把 AMCL 机器人位姿与真值机器人位姿的差打出来，区分"定位偏"还是"相机错"。
+        tb = self._truth_object_in_base()
+        if pb is not None and tb is not None:
+            self.get_logger().info(
+                f'  视觉 base 系 ({pb[0]:.3f},{pb[1]:.3f})｜真值 base 系 '
+                f'({tb[0]:.3f},{tb[1]:.3f})｜抓取误差 '
+                f'({(pb[0] - tb[0]) * 1000:+.0f},{(pb[1] - tb[1]) * 1000:+.0f})mm')
+        belief = self._map_pose()
+        if belief is not None and self.truth_robot is not None:
+            off = self.base_axle_offset
+            tx = self.truth_robot[0] + off * math.cos(self.truth_robot[2])
+            ty = self.truth_robot[1] + off * math.sin(self.truth_robot[2])
+            self.get_logger().info(
+                f'  AMCL 机器人 ({belief[0]:.3f},{belief[1]:.3f},'
+                f'{math.degrees(belief[2]):.1f}°)｜真值 ({tx:.3f},{ty:.3f},'
+                f'{math.degrees(self.truth_robot[2]):.1f}°)｜定位偏差 '
+                f'({(belief[0] - tx) * 1000:+.0f},{(belief[1] - ty) * 1000:+.0f})mm '
+                f'{(math.degrees(belief[2] - self.truth_robot[2])):+.1f}°')
+        self.vision_logged = True
 
     def _begin_pick(self):
         self.grasp_correct_count = 0        # 本轮抓取的"补进"计数清零
@@ -851,7 +1017,8 @@ class TaskOrchestrator(Node):
             return 'ok'
 
         rx, ry, ryaw = pose
-        dx, dy = self.object_x - rx, self.object_y - ry
+        ox, oy = self._obj_xy()
+        dx, dy = ox - rx, oy - ry
         c, s = math.cos(-ryaw), math.sin(-ryaw)
         bx = c * dx - s * dy          # 方块在 base 系的位置
         by = s * dx + c * dy
@@ -1364,7 +1531,8 @@ class TaskOrchestrator(Node):
 
     def _cube_world_xyz(self):
         """方块在 map 系的位姿：优先真值，与参数推算差太多则退回参数。"""
-        bx, by, bz = self.object_x, self.object_y, self.object_z
+        ox, oy = self._obj_xy()
+        bx, by, bz = ox, oy, self.object_z
         if self.truth_cube is None:
             return bx, by, bz, 'param'
         tx, ty, tz = self.truth_cube
@@ -1381,13 +1549,18 @@ class TaskOrchestrator(Node):
         """step②：按位姿放/删方块（同一份 diff 里先删后加，避免残留）。"""
         if not (self.scene_enable and self.scene_cube_on):
             return
-        objs = [self._make_box('red_cube', (0, 0, 0), (0, 0, 0),
-                               CollisionObject.REMOVE)]
+        if xyz is None and not self.cube_in_scene:
+            return      # 世界里本来就没有方块，别发无用的 REMOVE（move_group 会 WARN）
+        objs = []
+        if self.cube_in_scene:
+            objs.append(self._make_box('red_cube', (0, 0, 0), (0, 0, 0),
+                                       CollisionObject.REMOVE))
         if xyz is not None:
             s = 0.05 + 2.0 * self.scene_cube_padding
             objs.append(self._make_box('red_cube', xyz, (s, s, s)))
         self._apply_scene(world=PlanningSceneWorld(collision_objects=objs),
                           why='加入方块' if xyz else '移除方块')
+        self.cube_in_scene = xyz is not None
 
     def _scene_cube_on_detect(self):
         """step②：识别成功后加方块，并把"真值 / 参数"的偏差打出来。"""
@@ -1417,11 +1590,13 @@ class TaskOrchestrator(Node):
         aco.touch_links = [self.scene_attach_link, 'gripper_base_link',
                            'gripper_left_finger_link',
                            'gripper_right_finger_link', 'hand_link']
-        self._apply_scene(
-            world=PlanningSceneWorld(collision_objects=[
+        world = None
+        if self.cube_in_scene:
+            world = PlanningSceneWorld(collision_objects=[
                 self._make_box('red_cube', (0, 0, 0), (0, 0, 0),
-                               CollisionObject.REMOVE)]),
-            attached=[aco], why='方块挂到夹爪')
+                               CollisionObject.REMOVE)])
+        self._apply_scene(world=world, attached=[aco], why='方块挂到夹爪')
+        self.cube_in_scene = False
 
     def _scene_detach_cube(self):
         """放置脱开后：MoveIt 侧摘掉附着物体，并按放置位姿加回世界（可视化）。"""
@@ -1437,6 +1612,7 @@ class TaskOrchestrator(Node):
                 and self.scene_cube_on):
             z = self.scene_place_top_z + 0.025
             self._scene_set_cube((self.task.place_x, self.task.place_y, z))
+            self.cube_in_scene = True
             self.get_logger().info(
                 f'方块按放置位姿加回碰撞世界：'
                 f'({self.task.place_x:.3f},{self.task.place_y:.3f},{z:.3f})')
@@ -1552,6 +1728,11 @@ class TaskOrchestrator(Node):
         # --- 识别超时 / 对准 ---
         if self.stage != 'DETECT':
             return
+        # 识别样本攒够时间就收尾（后续没有新帧时靠这里触发，不必干等 detect_timeout）
+        if (self.det_samples and self.det_collect_deadline is not None
+                and now >= self.det_collect_deadline):
+            self._finish_detect()
+            return
         if self.phase == '识别中' and self.det_deadline is not None and \
                 now > self.det_deadline:
             if self.retry >= len(self.ALIGN_ACTIONS):
@@ -1615,12 +1796,15 @@ class TaskOrchestrator(Node):
                 f'移动 {self.move_vel * (self.back_duration if action == "back" else self.move_duration) * 100:.0f}cm）')
 
     def _reset_detect(self):
+        self.det_samples = None
+        self.det_collect_deadline = None
         self.det_deadline = self._now() + rclpy.duration.Duration(
             seconds=self.detect_timeout)
 
     # ================= 收尾 =================
     def _task_done(self):
         self.cmd_vel_pub.publish(Twist())      # 收尾同样清零底盘
+        self.obj_map_xy = None
         self._scene_cleanup()
         self.creep_start = None
         self.creep_settle_until = None
@@ -1632,6 +1816,7 @@ class TaskOrchestrator(Node):
 
     def _fail(self, reason):
         self._cancel_arm()
+        self.obj_map_xy = None
         self._scene_cleanup()
         # 【安全】必须先停底盘：蠕动微调是按 /cmd_vel 开环发的，而底盘插件会
         # 一直保持最后一条指令 —— 不在失败路径上清零，车会带着 0.08m/s 一直走。
