@@ -1058,3 +1058,97 @@ aruco_detector --/object_detection(pose=物体中心, camera_link_optical)-->
 所以 `p_cube = tvec − 26mm · R[:,2]`。右图：当年那个 59mm 误差的分解 ——
 **26mm 是几何（必然）、33mm 是定位/地图偏差**；而 y 方向没有几何项，
 却也有 27mm，正好反证了"剩下的都是定位误差"。
+
+### 9. M15：失败自动重试（按阶段分类，互不占用预算）
+
+之前任何一步失败都直接 `_fail` 终止任务，一次偶发（导航抖动、单帧 PnP 跳变、
+笛卡尔差 2%）就要重跑整个 demo。现在按**失败发生的阶段**分类重试：
+
+| 类别 | 触发点 | 重试动作 | 参数 |
+|---|---|---|---|
+| `nav` | Nav2 报 FAILED | 重发**同一个**导航目标（`last_nav`） | `nav_retries=1` |
+| `detect` | 识别 + 对准动作全失败 | 重置对准计数、重新进识别窗口 | `detect_retries=1` |
+| `pick` | 手臂序列失败/超时、抓取窗口补不进 | 收臂到 `carry` → 回 `SETTLE` 重新做可达性校验（必要时蠕动补进）→ 重抓 | `pick_retries=1` |
+| `place` | 放置序列失败/超时 | 重跑整段 `_place_ops()` | `place_retries=1` |
+
+公共逻辑：`_fail(reason)` 先算类别 → `_try_retry()`：
+* 先把现场清干净（取消手臂目标、清零 `/cmd_vel`、关识别、清蠕动状态）；
+* 进入 `RETRY_WAIT` 停 `retry_settle`（默认 1.0s）等机械臂/底盘停稳，再由 timer 执行重试动作；
+* 次数用完才走 `_fail_terminal()`（原来的终止路径），并打
+  `pick 已重试 1/1 次仍失败，任务终止`。
+
+两个关键细节：
+
+1. **已吸附时重抓必须先脱开**（`attached_ok` 跟踪）：否则会带着夹歪的方块重抓，
+   或者出现"世界里有方块 + 夹爪上也有方块"的脏状态；
+2. **类别判定不能看 `phase`**：`phase`（如 `识别中`）不会自动清空，残留下来会把
+   后面的 pick/place 失败误判成 detect、白烧 detect 预算。现在按 `stage` 优先判断，
+   `SETTLE`/ops 阶段用进入时记录的 `ops_category`。
+
+日志形如：
+
+```
+[重试] pick 失败：下压抓取 失败: 笛卡尔路径只算到 75% → 1.0s 后重试（第 1/1 次）
+抓取重试前先脱开已吸附的方块        ← 仅当失败发生在吸附之后
+收臂后重新校验抓取点
+```
+
+开关与预算都可以从 launch 传：`retry_enable:=false`、`pick_retries:=2`、`place_retries:=2`。
+
+#### 怎么人为制造一次失败（验证重试）
+
+**首选：注入开关**（确定性、一条命令、不用改场景）：
+
+```bash
+ros2 launch my_robot_bringup demo_all.launch.py fail_inject:=pick     # 抓取失败一次
+ros2 launch my_robot_bringup demo_all.launch.py fail_inject:=place    # 放置失败一次
+ros2 launch my_robot_bringup demo_all.launch.py fail_inject:=nav      # 导航到抓取点后失败一次
+ros2 launch my_robot_bringup demo_all.launch.py fail_inject:=detect   # 进入识别窗口即失败一次
+ros2 launch my_robot_bringup demo_all.launch.py fail_inject:=pick,place   # 两类各一次
+ros2 launch my_robot_bringup demo_all.launch.py fail_inject:=pick fail_inject_always:=true
+                                                                      # 重试也失败 → 验证次数耗尽
+```
+
+注入是**一次性**的（除非 `fail_inject_always:=true`），所以预期看到：
+
+```
+【测试钩子开启】将注入失败：['pick']（always=False）
+[手臂序列] 下压抓取            ← 注入点就在这里
+【注入失败】pick @ 下压抓取
+[重试] pick 失败：注入失败（pick @ 下压抓取） → 1.0s 后重试（第 1/1 次）
+[手臂序列] 预抓取 … 下压抓取 …  ← 重试走完整抓取序列并成功
+```
+
+**不想开钩子时，用真实参数/场景制造失败**：
+
+| 类别 | 制造方法 | 预期报错 |
+|---|---|---|
+| `pick` | `grasp_z:=0.50`（低于自碰地板 0.52） | `下压抓取 失败：笛卡尔路径只算到 75~78%` |
+| `detect` | 把方块挪出视野：`gz service -s /world/empty/set_pose --reqtype ignition.msgs.Pose --reqtype …`（或直接改世界文件里的 `red_cube` 位置） | `识别超时 … 对准` 后 `识别失败` |
+| `nav` | Gazebo GUI 按暂停（或 `gz service /world/empty/control` 设 `pause: true`） | 进度检查 30s 后 `导航失败` |
+| `place` | 下放瞬间暂停物理，或 `arm_timeout:=3` | `下放 超时` |
+
+#### 重试时"目标被拒绝"的正确处理（实测踩过）
+
+第一次实现重试时直接 `_fail` 就失败了，日志是：
+
+```
+[手臂序列] 预抓取 → 发送 /arm_task
+[my_robot_commander] 已有 arm_task 在执行，拒绝新目标
+[task_orchestrator] 任务失败：预抓取 被拒绝（可能上一动作未结束）
+```
+
+原因：`cancel_goal_async()` 是**异步**的，commander 的 `busy_` 要等当前目标真正结束
+才清零；而 `retry_settle`（1.0s）后重试就发了新目标 ⇒ 被拒 ⇒ 被当成失败。
+
+正确做法（现已实现）：**把"被拒绝"当作"忙，稍等重发"**：
+
+* 参数 `arm_resend_tries=20`、`arm_resend_delay=0.2`（总共约 4s 宽限）；
+* 被拒后在 timer 里 `0.2s` 后重发**同一个 op**（`op_kind='RESEND'`）；
+* 连续被拒 20 次才判失败（此时才交回分类重试/终止）；
+* 旧目标的迟到结果会被 `if self.ops is None: return` 丢掉，不会污染新序列。
+
+顺带修掉两条噪声：
+* `_retry_pick` 不再直接给 commander 发 `carry`（忙时会被静默拒绝），改为回 `SETTLE`
+  重新校验，由 ops 第一条"预抓取"把手臂带上去；
+* 未附着时不再发 `detach`（否则 move_group 报 `Attached body 'red_cube' not found`）。

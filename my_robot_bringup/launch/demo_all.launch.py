@@ -85,6 +85,11 @@ def generate_launch_description():
     place_approach_z = LaunchConfiguration('place_approach_z')
     place_down_z = LaunchConfiguration('place_down_z')
     attach_enabled = LaunchConfiguration('attach_enabled')
+    fail_inject = LaunchConfiguration('fail_inject')
+    fail_inject_always = LaunchConfiguration('fail_inject_always')
+    retry_enable = LaunchConfiguration('retry_enable')
+    pick_retries = LaunchConfiguration('pick_retries')
+    place_retries = LaunchConfiguration('place_retries')
     grasp_park_margin = LaunchConfiguration('grasp_park_margin')
     scene_tables = LaunchConfiguration('scene_tables')
     scene_cube = LaunchConfiguration('scene_cube')
@@ -238,6 +243,22 @@ def generate_launch_description():
         #   ③ 抓一次，若会撞方块，下压应变成"路径碰撞"失败；
         #   ④ scene_attach 负责抓起后挂到夹爪；
         #   ⑤ 最后再开 scene_place_table。
+        DeclareLaunchArgument(
+            'fail_inject', default_value='',
+            description='【测试钩子】人为注入失败验证重试：nav/detect/pick/place，'
+                        '逗号分隔可多个；默认空=关闭'),
+        DeclareLaunchArgument(
+            'fail_inject_always', default_value='false',
+            description='注入失败时每次都触发（重试也失败，用来验证次数耗尽）'),
+        DeclareLaunchArgument(
+            'retry_enable', default_value='true',
+            description='失败自动重试（M15）：按阶段分类，各自次数独立'),
+        DeclareLaunchArgument(
+            'pick_retries', default_value='1',
+            description='抓取失败重试次数（收臂+复检+重抓；已吸附会先脱开）'),
+        DeclareLaunchArgument(
+            'place_retries', default_value='1',
+            description='放置失败重试次数（重跑放置序列）'),
         DeclareLaunchArgument(
             'grasp_park_margin', default_value='0.20',
             description='抓取点提前这么多米停车：Nav2 只做粗到位，最后一段用 /cmd_vel 蠕动闭环'),
@@ -396,6 +417,11 @@ def generate_launch_description():
             'place_via': place_via,
             'place_via_dist': place_via_dist,
             'attach_enabled': attach_enabled,
+            'fail_inject': fail_inject,
+            'fail_inject_always': fail_inject_always,
+            'retry_enable': retry_enable,
+            'pick_retries': pick_retries,
+            'place_retries': place_retries,
             'grasp_park_margin': grasp_park_margin,
             'scene_tables': scene_tables,
             'scene_cube': scene_cube,

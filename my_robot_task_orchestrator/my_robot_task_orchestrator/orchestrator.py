@@ -99,6 +99,25 @@ class TaskOrchestrator(Node):
         # 发给导航前减去这个偏移、从 /amcl_pose 读回后加回来。
         # 若把 URDF 的 base_joint 改回 x=0，这里也要设成 0.0。
         self.declare_parameter('base_axle_offset', 0.15)
+        # --- M15：失败重试 ---
+        # 一次失败不再直接中止任务：按阶段分类重试，各自次数独立。
+        # 【测试钩子】人为注入失败，用来验证重试逻辑（默认关闭）
+        # 例：fail_inject:=pick  → 在"下压抓取"那一步直接失败一次（重试后即成功）
+        #     fail_inject:=pick,place   → 两类各注入一次
+        #     fail_inject:=nav / detect / pick / place
+        #     fail_inject_always:=true  → 每次都注入（重试也会失败，用来验证次数耗尽）
+        self.declare_parameter('fail_inject', '')
+        self.declare_parameter('fail_inject_always', False)
+        self.declare_parameter('retry_enable', True)
+        self.declare_parameter('nav_retries', 1)      # 导航失败 → 重发同一目标
+        self.declare_parameter('detect_retries', 1)   # 识别全失败 → 重新识别
+        self.declare_parameter('pick_retries', 1)     # 抓取失败 → 收臂 + 复检 + 重抓
+        self.declare_parameter('place_retries', 1)    # 放置失败 → 重跑放置序列
+        self.declare_parameter('retry_settle', 1.0)   # 重试前等待（等机械臂/底盘停稳）
+        # 【重要】commander 的 busy_ 要等当前目标真正结束后才清，取消是异步的。
+        # 所以"目标被拒绝"通常只是"还在忙"，不能当失败 —— 等一会儿重发。
+        self.declare_parameter('arm_resend_tries', 20)    # 被拒绝后最多重发几次
+        self.declare_parameter('arm_resend_delay', 0.2)   # 每次间隔 s（20*0.2≈4s 宽限）
         self.declare_parameter('max_retry', 10)
         self.declare_parameter('align_vel', 0.5)
         self.declare_parameter('rot_angle', 0.12)
@@ -298,6 +317,21 @@ class TaskOrchestrator(Node):
         self.det_collect_time = g('det_collect_time').value
         self.base_axle_offset = g('base_axle_offset').value
         self.max_retry = g('max_retry').value
+        self.retry_enable = bool(g('retry_enable').value)
+        self.fail_inject_always = bool(g('fail_inject_always').value)
+        self.fail_inject = {x.strip() for x in str(g('fail_inject').value).split(',')
+                            if x.strip()}
+        if self.fail_inject:
+            self.get_logger().warn(
+                f'【测试钩子开启】将注入失败：{sorted(self.fail_inject)}'
+                f'（always={self.fail_inject_always}）')
+        self.nav_retries = int(g('nav_retries').value)
+        self.detect_retries = int(g('detect_retries').value)
+        self.pick_retries = int(g('pick_retries').value)
+        self.place_retries = int(g('place_retries').value)
+        self.retry_settle = g('retry_settle').value
+        self.arm_resend_tries = int(g('arm_resend_tries').value)
+        self.arm_resend_delay = g('arm_resend_delay').value
         self.align_vel = g('align_vel').value
         self.rot_angle = g('rot_angle').value
         self.move_vel = g('move_vel').value
@@ -477,8 +511,15 @@ class TaskOrchestrator(Node):
         self.op_kind = None          # None / 'GOAL' / 'WAIT' / 'SERVER_WAIT'
         self.op_deadline = None
         self.op_wait_until = None
+        self.op_resend_left = 0      # 被拒绝后的重发配额
         self.op_goal_handle = None
         self.ops_done = None         # (state, phase)
+        self.ops_category = ''       # 'pick' / 'place'，失败时用来选重试策略
+        self.retry_counts = {}       # 各阶段已重试次数
+        self.retry_pending = None    # 延迟执行的重试动作
+        self.retry_at = None
+        self.last_nav = None         # 上一导航目标，供导航重试
+        self.attached_ok = False     # 是否已吸附（决定重试前要不要先脱开）
         self.ops_then = None
 
         self.create_timer(0.1, self.timer_cb)
@@ -556,6 +597,8 @@ class TaskOrchestrator(Node):
             f'({msg.place_x:.2f},{msg.place_y:.2f}) '
             f'yaw={msg.place_yaw:.2f} frame={msg.place_frame_id}')
         self.obj_map_xy = None            # 每轮重新测量
+        self.retry_counts = {}            # 每轮任务重新给重试预算
+        self.attached_ok = False
         self.vision_logged = False
         self._scene_add_tables()
         self._scene_set_cube(None)      # 清掉上一轮可能残留的方块
@@ -601,6 +644,7 @@ class TaskOrchestrator(Node):
         g.y = float(gy)
         g.yaw = float(yaw)
         self.nav_goal = (float(gx), float(gy))  # 用于校验"已到达"是否可信
+        self.last_nav = (x, y, yaw, frame, state, phase, stage)   # 供导航重试
         self._pub_status(state, phase)
         self.stage = stage
         self.stage_deadline = self._now() + rclpy.duration.Duration(
@@ -614,6 +658,8 @@ class TaskOrchestrator(Node):
             self.get_logger().info(
                 f'{phase}：({gx:.2f},{gy:.2f}) yaw={g.yaw:.2f} frame={frame}')
         self.nav_pub.publish(g)
+        if stage == 'NAV_GRASP':
+            self._maybe_inject('nav', phase)
 
     def _nav_to_object(self):
         self._send_nav(self.obs_x, self.obs_y, self.obs_yaw, self.obs_frame,
@@ -1108,6 +1154,7 @@ class TaskOrchestrator(Node):
                         f'→ 不再微调，直接按实测位置抓')
                     self.pick_tool_x, self.pick_tool_y = bx, by
                     self.stage = 'PICK'
+                    self.ops_category = 'pick'
                     self._run_ops(self._pick_ops(),
                                   TaskStatus.PICKED, '抓取完成，准备搬运',
                                   then=self._nav_to_place)
@@ -1200,6 +1247,16 @@ class TaskOrchestrator(Node):
             seconds=self.arm_server_timeout)
         self._op_start()
 
+    def _maybe_inject(self, cat, where):
+        """测试钩子：按类别注入一次失败（用 fail_inject 参数开启）。"""
+        if cat not in self.fail_inject:
+            return False
+        if not self.fail_inject_always:
+            self.fail_inject.discard(cat)      # 一次性：注入后重试就能成功
+        self.get_logger().warn(f'【注入失败】{cat} @ {where}')
+        self._fail(f'注入失败（{cat} @ {where}）')
+        return True
+
     def _op_start(self):
         if self.ops is None:
             return
@@ -1215,6 +1272,10 @@ class TaskOrchestrator(Node):
                 return
             op = self.ops[self.op_idx]
             self._pub_status(None, op['label'])
+            # 测试钩子：抓取注入在"下压抓取"，放置注入在"下放"
+            for cat, label in (('pick', '下压抓取'), ('place', '下放')):
+                if op['label'] == label and self._maybe_inject(cat, label):
+                    return
 
             if op['kind'] == 'fn':
                 self.get_logger().info(f'[手臂序列] {op["label"]}')
@@ -1243,6 +1304,7 @@ class TaskOrchestrator(Node):
                 return
             self.get_logger().info(f'[手臂序列] {op["label"]} → 发送 /arm_task')
             self.op_kind = 'GOAL'
+            self.op_resend_left = self.arm_resend_tries
             self.op_deadline = self._now() + rclpy.duration.Duration(
                 seconds=self.arm_timeout)
             fut = self.arm_client.send_goal_async(op['goal'])
@@ -1258,7 +1320,19 @@ class TaskOrchestrator(Node):
             self._fail(f'发送手臂目标异常: {e}')
             return
         if not handle.accepted:
-            self._fail(f'{self.ops[self.op_idx]["label"]} 被拒绝（可能上一动作未结束）')
+            # 上一目标可能还没收尾（取消是异步的）⇒ 等一会儿重发；
+            # 连续被拒 arm_resend_tries 次才判失败。
+            label = self.ops[self.op_idx]['label']
+            if self.op_resend_left > 0:
+                self.op_resend_left -= 1
+                self.get_logger().warn(
+                    f'{label} 被拒绝（上一动作还没结束）→ '
+                    f'{self.arm_resend_delay:.1f}s 后重发（还剩 {self.op_resend_left} 次）')
+                self.op_kind = 'RESEND'
+                self.op_wait_until = self._now() + rclpy.duration.Duration(
+                    seconds=self.arm_resend_delay)
+                return
+            self._fail(f'{label} 连续被拒 {self.arm_resend_tries} 次（/arm_task 一直忙）')
             return
         self.op_goal_handle = handle
         handle.get_result_async().add_done_callback(self._on_goal_result)
@@ -1602,11 +1676,13 @@ class TaskOrchestrator(Node):
         """放置脱开后：MoveIt 侧摘掉附着物体，并按放置位姿加回世界（可视化）。"""
         if not (self.scene_enable and self.scene_attach_on):
             return
-        aco = AttachedCollisionObject()
-        aco.link_name = self.scene_attach_link
-        aco.object = self._make_box('red_cube', (0, 0, 0), (0, 0, 0),
-                                    CollisionObject.REMOVE)
-        self._apply_scene(attached=[aco], why='方块脱离夹爪')
+        if self.attached_ok:
+            aco = AttachedCollisionObject()
+            aco.link_name = self.scene_attach_link
+            aco.object = self._make_box('red_cube', (0, 0, 0), (0, 0, 0),
+                                        CollisionObject.REMOVE)
+            self._apply_scene(attached=[aco], why='方块脱离夹爪')
+        # 没附着过就不发，否则 move_group 报 Attached body 'red_cube' not found
         # 放回世界：位置 = 任务的放置点，高度 = 放置台面 + 方块半高
         if (self.task is not None and self.scene_place_top_z is not None
                 and self.scene_cube_on):
@@ -1630,10 +1706,12 @@ class TaskOrchestrator(Node):
         self._pub_empty(self.attach_pub, f'吸附 attach → {self.attach_topic}')
         # MoveIt 侧同步：世界里的方块摘掉、挂到夹爪，否则搬运规划会绕着它走
         self._scene_attach_cube()
+        self.attached_ok = True
 
     def _do_detach(self):
         self._pub_empty(self.detach_pub, f'脱开 detach → {self.detach_topic}')
         self._scene_detach_cube()
+        self.attached_ok = False
 
     def startup_detach_cb(self):
         """上电后补几次脱开，抵消 DetachableJoint 在 Configure 时的自动连接。"""
@@ -1646,8 +1724,20 @@ class TaskOrchestrator(Node):
     def timer_cb(self):
         now = self._now()
 
+        # --- 重试等待（M15）---
+        if self.stage == 'RETRY_WAIT':
+            if self.retry_at is not None and now >= self.retry_at:
+                act, self.retry_pending = self.retry_pending, None
+                self.retry_at = None
+                if act:
+                    act()
+            return
+
         # --- 手臂序列驱动 ---
         if self.ops is not None:
+            if self.op_kind == 'RESEND' and now >= self.op_wait_until:
+                self._op_start()          # 重发同一个 op
+                return
             if self.op_kind == 'WAIT' and now >= self.op_wait_until:
                 self.op_idx += 1
                 self._op_start()
@@ -1700,12 +1790,16 @@ class TaskOrchestrator(Node):
             if self.settle_start is not None and \
                     (now - self.settle_start).nanoseconds / 1e9 > self.settle_time:
                 nxt, self.settle_next = self.settle_next, None
+                self.ops_category = {'PICK': 'pick', 'PLACE': 'place',
+                                     'DETECT': 'detect'}.get(nxt, '')
                 if nxt == 'DETECT':
                     self.stage = 'DETECT'
                     self._set_detect(True, '进入识别窗口')
                     self._pub_status(None, '识别中')
                     self._reset_detect()
                     self.get_logger().info('已稳定，开始识别')
+                    if self._maybe_inject('detect', '进入识别窗口'):
+                        return
                 elif nxt == 'PICK':
                     verdict = self._check_grasp_reachable()
                     if verdict == 'fail':
@@ -1715,11 +1809,13 @@ class TaskOrchestrator(Node):
                     if verdict == 'done':
                         return          # 偏差极小，已直接开始抓取序列
                     self.stage = 'PICK'
+                    self.ops_category = 'pick'
                     self._run_ops(self._pick_ops(),
                                   TaskStatus.PICKED, '抓取完成，准备搬运',
                                   then=self._nav_to_place)
                 elif nxt == 'PLACE':
                     self.stage = 'PLACE'
+                    self.ops_category = 'place'
                     self._run_ops(self._place_ops(),
                                   TaskStatus.PLACED, '放置完成',
                                   then=self._task_done)
@@ -1804,6 +1900,10 @@ class TaskOrchestrator(Node):
     # ================= 收尾 =================
     def _task_done(self):
         self.cmd_vel_pub.publish(Twist())      # 收尾同样清零底盘
+        self.retry_counts = {}
+        self.retry_pending = None
+        self.retry_at = None
+        self.attached_ok = False
         self.obj_map_xy = None
         self._scene_cleanup()
         self.creep_start = None
@@ -1814,7 +1914,105 @@ class TaskOrchestrator(Node):
         self.task = None
         self.object_pose = None
 
-    def _fail(self, reason):
+    # ================= M15：失败分类 + 重试 =================
+    def _stage_category(self):
+        """当前失败属于哪一类（决定重试策略）。按阶段判断，SETTLE 用进入时的上下文。"""
+        st = self.stage or ''
+        # 【顺序很重要】先按 stage 判断：phase 会残留（识别阶段的"识别中"不会自动清），
+        # 若先看 phase，后面的 pick/place 失败会被误判成 detect、白白烧掉 detect 预算。
+        if st.startswith('NAV'):
+            return 'nav'
+        if st.startswith('PICK'):
+            return 'pick'
+        if st.startswith('PLACE'):
+            return 'place'
+        if st == 'SETTLE' or self.ops is not None:
+            return self.ops_category        # 由进入 SETTLE/ops 时的上下文决定
+        if st == 'DETECT' or self.phase == '识别中':
+            return 'detect'
+        return ''
+
+    def _try_retry(self, cat, reason):
+        """能重试就安排一次重试并返回 True；不能则返回 False（调用方终止任务）。"""
+        if not (self.retry_enable and cat):
+            return False
+        limit = {'nav': self.nav_retries, 'detect': self.detect_retries,
+                 'pick': self.pick_retries, 'place': self.place_retries}.get(cat, 0)
+        used = self.retry_counts.get(cat, 0)
+        if limit <= 0 or used >= limit:
+            if limit > 0:
+                self.get_logger().error(f'{cat} 已重试 {used}/{limit} 次仍失败，任务终止')
+            return False
+        # 清理现场（与终止路径相同的安全动作，但不结束任务）
+        self._cancel_arm()
+        self.ops = None
+        self.op_kind = None
+        self.cmd_vel_pub.publish(Twist())      # 蠕动是开环发 /cmd_vel，必须清零
+        self.creep_start = None
+        self.creep_settle_until = None
+        self._set_detect(False, '准备重试')
+        self.retry_counts[cat] = used + 1
+        self.retry_pending = {'nav': self._retry_nav, 'detect': self._retry_detect,
+                              'pick': self._retry_pick,
+                              'place': self._retry_place}[cat]
+        self.retry_at = self._now() + rclpy.duration.Duration(
+            seconds=self.retry_settle)
+        self.stage = 'RETRY_WAIT'
+        self.get_logger().warn(
+            f'[重试] {cat} 失败：{reason} → {self.retry_settle:.1f}s 后重试'
+            f'（第 {used + 1}/{limit} 次）')
+        self._pub_status(TaskStatus.RUNNING, f'重试中（{cat} {used + 1}/{limit}）')
+        return True
+
+    def _retry_nav(self):
+        if not self.last_nav:
+            self._fail_terminal('导航重试失败：没有记录上一目标')
+            return
+        self.get_logger().warn('重发上一导航目标')
+        self._send_nav(*self.last_nav)
+
+    def _retry_detect(self):
+        self.retry = 0
+        self.det_samples = None
+        self.obj_map_xy = None
+        self.stage = 'DETECT'
+        self.phase = '识别中'
+        self._pub_status(TaskStatus.RUNNING, '重新识别')
+        self._set_detect(True, '重试：进入识别窗口')
+        self._reset_detect()
+        self.get_logger().warn('重新进入识别窗口')
+
+    def _retry_pick(self):
+        if self.attached_ok:
+            self.get_logger().warn('抓取重试前先脱开已吸附的方块')
+            self._do_detach()          # 方块可能被夹歪/蹭动，不能带着它重抓
+        self.ops = None
+        self.op_kind = None
+        self.grasp_correct_count = 0
+        # 不在这里直接给 commander 发 carry（忙时会被静默拒绝）；回 SETTLE 重新校验，
+        # 之后由 ops 的第一条"预抓取"把手臂从当前位置带上去。
+        self.stage = 'SETTLE'          # 重新做可达性校验（必要时蠕动补进）
+        self.ops_category = 'pick'
+        self.settle_start = self._now()
+        self.settle_next = 'PICK'
+        self._pub_status(TaskStatus.GRASPING, '重新校验抓取点')
+
+    def _retry_place(self):
+        self.ops = None
+        self.op_kind = None
+        self.stage = 'PLACE'
+        self.ops_category = 'place'
+        self.get_logger().warn('重跑放置序列')
+        self._run_ops(self._place_ops(), TaskStatus.PLACED, '放置完成',
+                      then=self._task_done)
+
+    def _fail(self, reason, category=None):
+        cat = category if category is not None else self._stage_category()
+        if self._try_retry(cat, reason):
+            return
+        self._fail_terminal(reason)
+
+    def _fail_terminal(self, reason):
         self._cancel_arm()
         self.obj_map_xy = None
         self._scene_cleanup()
