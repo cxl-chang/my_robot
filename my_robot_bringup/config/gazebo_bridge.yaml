@@ -87,3 +87,16 @@
   ros_type_name: "tf2_msgs/msg/TFMessage"
   gz_type_name: "ignition.msgs.Pose_V"
   direction: GZ_TO_ROS
+
+# --- 腕部相机（eye-in-hand）：抓取前做"夹爪↔方块"相对对齐 ---
+- ros_topic_name: "/wrist_camera/camera_info"
+  gz_topic_name: "/wrist_camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "ignition.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/wrist_camera/image_raw"
+  gz_topic_name: "/wrist_camera/image_raw"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "ignition.msgs.Image"
+  direction: GZ_TO_ROS

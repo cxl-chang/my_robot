@@ -1,0 +1,130 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org.wiki/xacro">
+
+    <!-- ================= 腕部相机（eye-in-hand）+ 短支架 =================
+         已带 Gazebo 相机传感器；collision 与 visual 同尺寸。
+
+         【硬约束：所有零件必须留 z ∈ [-0.020, 0] 这条 2cm 带子里】
+         手部那条带子 = 掌心面(z=0) 到腕关节 joint6 轴线(z=-0.020)。
+         FCL 实测（tools/check_self_collision.py 扫 joint6，基准 carry）：
+           只要附件伸出 z<-0.020（进入腕部/小臂的 z 范围），joint6 转到 45~135°
+           就会插进 forearm_link，最深 95mm。因为 carry 里 joint5=59°，小臂是斜的，
+           8cm 宽的方块直接横在扫掠路径上 —— 与立柱半径多大无关。
+         ⇒ 支架/相机全部限制在 z ≥ -0.020 **并留 8mm 间隙**（最早贴到 -0.020 时，
+         FCL 把"恰好接触"判成碰撞，导致 mount↔wrist_link 常态冲突、全部规划失败）。
+
+         【代价：必须内倾】
+         在这 2cm 带子里，光轴若与指爪平行，外伸只能到 ~48mm 才不出画面。
+         内倾 42.3° 后可以外伸 70mm，同时把方块摆在画面中心：
+           镜头端面 (0,-0.070,-0.002) → 抓取时方块中心 (0,0,+0.075)
+         实测：整块方块横向占 19°、纵向 20°（半视场 40°/32.2°）⇒ 完整可见。
+
+         【坐标系】+z 沿工具轴指向桌面；指爪在 x=±0.07、z∈[0.02,0.10]；
+         抓取时方块中心在 tool 系 (0, 0, +0.075)。
+         【SRDF】支架/相机与 gripper_base、hand 为刚性连接 → Adjacent/Never；
+         与 wrist_link、forearm_link **不关闭检查**（本设计实测通过）。 -->
+
+    <xacro:property name="wcam_r" value="0.009" />
+    <xacro:property name="wcam_len" value="0.016" />
+    <!-- 光轴：从镜头端面指向抓取时方块中心 ⇒ (0,0.673,0.740)，内倾 42.3° -->
+    <xacro:property name="wcam_tilt" value="-0.7782" />
+    <!-- 相机圆柱中心 = 镜头端面沿轴回退半个长度 -->
+    <xacro:property name="wcam_cy" value="-0.0757" />
+    <xacro:property name="wcam_cz" value="0.0004" />
+
+    <!-- ===== 短支架（与掌心同坐标系；全部在 z ≥ -0.020） ===== -->
+    <link name="wrist_camera_mount_link">
+        <!-- 立柱：贴掌心腕侧面外侧（y<-0.040），高 20mm -->
+        <visual>
+            <origin xyz="0.0 -0.044 -0.0020" rpy="0 0 0"/>
+            <geometry><box size="0.012 0.006 0.020"/></geometry>
+            <material name="bracket_grey"><color rgba="0.76 0.76 0.78 1.0"/></material>
+        </visual>
+        <collision>
+            <origin xyz="0.0 -0.044 -0.0020" rpy="0 0 0"/>
+            <geometry><box size="0.012 0.006 0.020"/></geometry>
+        </collision>
+        <!-- 横臂：向外伸到相机正上方 -->
+        <visual>
+            <origin xyz="0.0 -0.066 -0.0090" rpy="0 0 0"/>
+            <geometry><box size="0.012 0.044 0.006"/></geometry>
+            <material name="bracket_grey"/>
+        </visual>
+        <collision>
+            <origin xyz="0.0 -0.066 -0.0090" rpy="0 0 0"/>
+            <geometry><box size="0.012 0.044 0.006"/></geometry>
+        </collision>
+        <inertial>
+            <mass value="0.006"/>
+            <inertia ixx="6e-7" ixy="0" ixz="0" iyy="6e-7" iyz="0" izz="6e-7"/>
+        </inertial>
+    </link>
+
+    <joint name="wrist_camera_mount_joint" type="fixed">
+        <parent link="gripper_base_link"/>
+        <child link="wrist_camera_mount_link"/>
+        <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+    </joint>
+
+    <!-- ===== 相机本体：橙色圆柱（+x = 光轴），内倾 42.3° ===== -->
+    <link name="wrist_camera_link">
+        <visual>
+            <origin xyz="0 0 0" rpy="0 ${pi/2} 0"/>
+            <geometry><cylinder radius="${wcam_r}" length="${wcam_len}"/></geometry>
+            <material name="camera_orange"><color rgba="1.0 0.45 0.05 1.0"/></material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 ${pi/2} 0"/>
+            <geometry><cylinder radius="${wcam_r}" length="${wcam_len}"/></geometry>
+        </collision>
+        <inertial>
+            <mass value="0.004"/>
+            <inertia ixx="4e-7" ixy="0" ixz="0" iyy="4e-7" iyz="0" izz="4e-7"/>
+        </inertial>
+    </link>
+
+    <!-- 安装关节：把 +x 转到光轴方向 (0,0.673,0.740)；yaw 90° 让画面水平轴=两指连线 -->
+    <joint name="wrist_camera_joint" type="fixed">
+        <parent link="wrist_camera_mount_link"/>
+        <child link="wrist_camera_link"/>
+        <origin xyz="0.0 ${wcam_cy} ${wcam_cz}" rpy="0.0 ${wcam_tilt} 1.5708"/>
+    </joint>
+
+    <!-- ===== 光学帧：z 朝前、x 朝右、y 朝下 ===== -->
+    <link name="wrist_camera_optical" />
+    <joint name="wrist_optical_joint" type="fixed">
+        <origin xyz="0.0 0.0 0.0" rpy="${-pi/2} 0.0 ${-pi/2}"/>
+        <parent link="wrist_camera_link"/>
+        <child link="wrist_camera_optical"/>
+    </joint>
+
+    <!-- ===== Gazebo 相机传感器（640x480，只看近处） ===== -->
+    <gazebo reference="wrist_camera_link">
+        <sensor name="wrist_camera" type="camera">
+            <camera>
+                <horizontal_fov>1.39626345</horizontal_fov>
+                <image>
+                    <width>640</width>
+                    <height>480</height>
+                    <format>R8G8B8</format>
+                </image>
+                <clip>
+                    <near>0.02</near>
+                    <far>2.0</far>
+                </clip>
+                <noise>
+                    <type>gaussian</type>
+                    <mean>0.0</mean>
+                    <stddev>0.0</stddev>
+                </noise>
+                <optical_frame_id>wrist_camera_optical</optical_frame_id>
+                <camera_info_topic>wrist_camera/camera_info</camera_info_topic>
+            </camera>
+            <always_on>1</always_on>
+            <update_rate>15</update_rate>
+            <visualize>false</visualize>
+            <topic>wrist_camera/image_raw</topic>
+        </sensor>
+    </gazebo>
+
+</robot>

@@ -12,6 +12,7 @@
     <xacro:include filename="lidar.xacro" />
     <xacro:include filename="camera.xacro" />
     <xacro:include filename="arm.urdf.xacro" />
+    <xacro:include filename="wrist_camera.xacro" />
     <xacro:include filename="arm.gazebo.xacro" />
 
     <xacro:include filename="my_robot.ros2_control.xacro" />

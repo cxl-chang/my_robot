@@ -91,6 +91,14 @@
     <!--VIRTUAL JOINT: Purpose: this element defines a virtual joint between a robot link and an external frame of reference (considered fixed with respect to the robot)-->
     <virtual_joint name="virtual_joint" type="fixed" parent_frame="world" child_link="base_footlink"/>
     <!--DISABLE COLLISIONS: By default it is assumed that any link of the robot could potentially come into collision with any other link in the robot. This tag disables collision checking between a specified pair of links. -->
+
+    <!-- 腕部相机 + 支架：与 gripper/hand/wrist/forearm 刚性连接，关掉它们之间的自碰检查 -->
+    <disable_collisions link1="gripper_base_link" link2="wrist_camera_mount_link" reason="Adjacent"/>
+    <disable_collisions link1="wrist_camera_mount_link" link2="wrist_camera_link" reason="Adjacent"/>
+    <disable_collisions link1="wrist_camera_mount_link" link2="hand_link" reason="Never"/>
+    <disable_collisions link1="wrist_camera_link" link2="hand_link" reason="Never"/>
+    <disable_collisions link1="wrist_camera_link" link2="gripper_left_finger_link" reason="Never"/>
+    <disable_collisions link1="wrist_camera_link" link2="gripper_right_finger_link" reason="Never"/>
     <disable_collisions link1="arm_base_link" link2="arm_link" reason="Never"/>
     <disable_collisions link1="arm_base_link" link2="base_link" reason="Adjacent"/>
     <disable_collisions link1="arm_base_link" link2="camera_link" reason="Never"/>
