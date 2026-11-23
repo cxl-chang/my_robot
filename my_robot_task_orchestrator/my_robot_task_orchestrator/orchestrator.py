@@ -229,7 +229,10 @@ class TaskOrchestrator(Node):
         self.declare_parameter('grasp_auto_max_fwd', 1.2)
         # 方块超出可靠区间但只差一点点时，自动补走一小段再抓（视觉伺服式）
         self.declare_parameter('grasp_correct_max', 0.30)    # 单次最大补进量 m
-        self.declare_parameter('grasp_correct_steps', 2)     # 最多补进几次
+        # 最多补进几次。取 3 而不是 2：实际一次抓取可能要用两步 ——
+        # ① 导航停在抓取点前 0.20m，按估算位置补进；② 腕相机实测发现还差
+        # 20~40mm（估算比真值偏 3~5cm 是常态），再补一步。留一步余量。
+        self.declare_parameter('grasp_correct_steps', 3)
         # 【必须】补进的最小步长：要补的距离若小于 Nav2 的 xy_goal_tolerance
         # (0.05)，导航会认为"已经在目标点上"而一步不动（踩过）。而且导航总在
         # 目标点前 ~0.05m 就判到位，所以"目标步长 ≈ 期望位移 + 0.05"：
@@ -746,6 +749,9 @@ class TaskOrchestrator(Node):
         """
         fwd = self.grasp_forward
         if self.grasp_auto:
+            # 这里用的是**map 系**的方块位置，不加 pos_fix：pos_fix 是"腕相机实测 −
+            # 估算"的 base 系横向差，只在 base 系里累加才成立。这条链的残余误差
+            # 由抓取点的蠕动微调 + 腕相机对齐收掉（see _check_grasp_reachable）。
             c, s = math.cos(self.obs_yaw), math.sin(self.obs_yaw)
             ox, oy = self._obj_xy()
             gx = ox - (self.tool_x * c - self.tool_y * s)
@@ -1393,23 +1399,29 @@ class TaskOrchestrator(Node):
             return 'ok'
 
         rx, ry, ryaw = pose
-        ox, oy = self._obj_xy()
-        dx, dy = ox - rx, oy - ry
-        c, s = math.cos(-ryaw), math.sin(-ryaw)
-        bx = c * dx - s * dy          # 方块在 base 系的位置
-        by = s * dx + c * dy
+        # 【必须走 _object_in_base()】它是"方块在 base 系"的唯一入口，里面加了
+        # 腕相机实测出来的位置修正量 pos_fix。这里若自己再算一遍（不加修正），
+        # 就会和蠕动循环（用 _object_in_base，含修正）对同一件事得出两个答案：
+        # 校验说"还差 27mm 要前进"，蠕动循环说"已到位"⇒ 底盘一动不动地空转，
+        # 直到重试次数用光（实测事故：真值 0.437 明明在窗口内却一直判 0.462）。
+        cur = self._object_in_base()
+        if cur is None:
+            self.get_logger().warn('还没收到 /amcl_pose，无法做抓取可达性校验（跳过）')
+            return 'ok'
+        bx, by = cur[0], cur[1]
         ex = bx - self.grasp_target_x
         ey = by - self.grasp_target_y
         err = math.hypot(ex, ey)
         tb = self._truth_object_in_base()
         truth_txt = ''
         if tb is not None:
-            # 真值 vs belief 并排：能直接区分"定位误差"和"底盘没走够"
+            # 真值 vs 估算并排：能直接区分"定位误差"和"底盘没走够"
             truth_txt = (f'｜真值 ({tb[0]:.3f},{tb[1]:.3f})，'
                          f'差 ({(bx - tb[0]) * 1000:+.0f},{(by - tb[1]) * 1000:+.0f})mm')
         self.get_logger().info(
-            f'抓取校验：方块在 base 系 ({bx:.3f},{by:.3f})，抓取目标 '
-            f'({self.grasp_target_x:.3f},{self.grasp_target_y:.3f})，偏差 '
+            f'抓取校验：方块在 base 系 ({bx:.3f},{by:.3f})'
+            f'{"（已含位置修正量）" if math.hypot(*self.pos_fix) > 1e-6 else ""}，'
+            f'抓取目标 ({self.grasp_target_x:.3f},{self.grasp_target_y:.3f})，偏差 '
             f'{err * 1000:.0f} mm（机器人实际位姿 '
             f'({rx:.2f},{ry:.2f},{math.degrees(ryaw):.1f}°)）{truth_txt}')
 
@@ -1473,40 +1485,48 @@ class TaskOrchestrator(Node):
             step = need + math.copysign(self.grasp_park_shortfall, need)
             if abs(step) < self.grasp_correct_min:
                 step = math.copysign(self.grasp_correct_min, need)
-            if (abs(step) <= self.grasp_correct_max
-                    and self.grasp_correct_count < self.grasp_correct_steps):
-                self.grasp_correct_count += 1
-                self.creep_dist = need          # 精确走这么多，不再加"到位短差补偿"
-                if abs(need) < self.creep_deadband:
-                    self.get_logger().info(
-                        f'方块在 base 系 x={bx:.3f}，与窗口中点 {self.grasp_x_mid:.3f} '
-                        f'只差 {need * 1000:+.1f} mm（< {self.creep_deadband * 1000:.0f} mm）'
-                        f'→ 不再微调，直接按实测位置抓')
-                    self.pick_tool_x, self.pick_tool_y = bx, by
-                    self.stage = 'PICK'
-                    self.ops_category = 'pick'
-                    # 先到 pregrasp 张开夹爪 → 腕相机对齐 → 下压 → 复核 → 合拢
-                    self._run_ops(self._pick_ops_approach(), TaskStatus.GRASPING,
-                                  '已到预抓取位', then=self._start_wrist_align)
-                    return 'done'
-                self.creep_start = self._now()
-                self.creep_settle_until = None
-                self.stage = 'PICK_CREEP'
-                self.get_logger().warn(
+            # 已经在窗口中点附近：不需要再动（也不能算一次微调）
+            if abs(need) < self.creep_deadband:
+                self.get_logger().info(
+                    f'方块在 base 系 x={bx:.3f}，与窗口中点 {self.grasp_x_mid:.3f} '
+                    f'只差 {need * 1000:+.1f} mm（< {self.creep_deadband * 1000:.0f} mm）'
+                    f'→ 不再微调，直接按实测位置抓')
+                self.pick_tool_x, self.pick_tool_y = bx, by
+                self.stage = 'PICK'
+                self.ops_category = 'pick'
+                # 先到 pregrasp 张开夹爪 → 腕相机对齐 → 下压 → 复核 → 合拢
+                self._run_ops(self._pick_ops_approach(), TaskStatus.GRASPING,
+                              '已到预抓取位', then=self._start_wrist_align)
+                return 'done'
+            # 失败原因分开报（合在一起会让人以为"微调上限"是罪魁）：
+            if abs(step) > self.grasp_correct_max:
+                self._fail(
                     f'方块在 base 系 x={bx:.3f}，安全窗口 '
-                    f'[{self.grasp_x_min:.2f},{self.grasp_reach_x_max:.2f}] → '
-                    f'直接蠕动{"前进" if need > 0 else "后退"} '
-                    f'{abs(need) * 1000:.0f} mm（{self.creep_vel} m/s，约 '
-                    f'{abs(need) / self.creep_vel:.1f}s，不走导航）'
-                    f'（第 {self.grasp_correct_count}/{self.grasp_correct_steps} 次）')
-                return 'retry'
-            self._fail(
+                    f'[{self.grasp_x_min:.2f},{self.grasp_reach_x_max:.2f}]，'
+                    f'需要{"前进" if need > 0 else "后退"} {abs(step) * 1000:.0f} mm，'
+                    f'超出单次微调上限 {self.grasp_correct_max * 1000:.0f} mm')
+                return 'fail'
+            if self.grasp_correct_count >= self.grasp_correct_steps:
+                self._fail(
+                    f'方块在 base 系 x={bx:.3f}，安全窗口 '
+                    f'[{self.grasp_x_min:.2f},{self.grasp_reach_x_max:.2f}]，'
+                    f'还需{"前进" if need > 0 else "后退"} {abs(need) * 1000:.0f} mm，'
+                    f'但本次抓取的微调次数已用完'
+                    f'（{self.grasp_correct_count}/{self.grasp_correct_steps} 次）')
+                return 'fail'
+            self.grasp_correct_count += 1
+            self.creep_dist = need          # 精确走这么多，不再加"到位短差补偿"
+            self.creep_start = self._now()
+            self.creep_settle_until = None
+            self.stage = 'PICK_CREEP'
+            self.get_logger().warn(
                 f'方块在 base 系 x={bx:.3f}，安全窗口 '
-                f'[{self.grasp_x_min:.2f},{self.grasp_reach_x_max:.2f}]，'
-                f'需要{"前进" if need > 0 else "后退"} {abs(step) * 1000:.0f} mm，'
-                f'超出单次微调上限 {self.grasp_correct_max * 1000:.0f} mm'
-                f'（或已用完 {self.grasp_correct_steps} 次）')
-            return 'fail'
+                f'[{self.grasp_x_min:.2f},{self.grasp_reach_x_max:.2f}] → '
+                f'直接蠕动{"前进" if need > 0 else "后退"} '
+                f'{abs(need) * 1000:.0f} mm（{self.creep_vel} m/s，约 '
+                f'{abs(need) / self.creep_vel:.1f}s，不走导航）'
+                f'（第 {self.grasp_correct_count}/{self.grasp_correct_steps} 次）')
+            return 'retry'
 
         return 'ok'
 
