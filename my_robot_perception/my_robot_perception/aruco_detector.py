@@ -114,8 +114,15 @@ class ArucoDetector(Node):
         # 状态，避免"orchestrator 先发了 disable、detector 后启动错过消息"或反过来
         # "enable 消息丢了导致任务永远识别不到"这类时序问题。
         self.declare_parameter('enable_topic', '/detection_enable')
+        # 话题参数化：同一份节点代码可跑多路相机（底盘相机 / 腕部相机）
+        self.declare_parameter('image_topic', '/camera/image_raw')
+        self.declare_parameter('caminfo_topic', '/camera/camera_info')
+        self.declare_parameter('det_topic', '/object_detection')
         self.declare_parameter('start_enabled', True)   # 无人控制时的默认状态
         self.enable_topic = self.get_parameter('enable_topic').value
+        self.image_topic = self.get_parameter('image_topic').value
+        self.caminfo_topic = self.get_parameter('caminfo_topic').value
+        self.det_topic = self.get_parameter('det_topic').value
         self.enabled = bool(self.get_parameter('start_enabled').value)
         self.enable_qos = QoSProfile(depth=1,
                                      durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -123,11 +130,11 @@ class ArucoDetector(Node):
             Bool, self.enable_topic, self.enable_cb, self.enable_qos)
 
         self.image_sub = self.create_subscription(
-            Image, '/camera/image_raw', self.image_cb, self.sensor_qos)
+            Image, self.image_topic, self.image_cb, self.sensor_qos)
         self.caminfo_sub = self.create_subscription(
-            CameraInfo, '/camera/camera_info', self.caminfo_cb, self.sensor_qos)
+            CameraInfo, self.caminfo_topic, self.caminfo_cb, self.sensor_qos)
         self.det_pub = self.create_publisher(
-            ObjectDetection, '/object_detection', 10)
+            ObjectDetection, self.det_topic, 10)
 
         self.aruco_dict = cv2.aruco.Dictionary_get(ARUCO_DICT)
         self.aruco_params = cv2.aruco.DetectorParameters_create()
@@ -173,9 +180,9 @@ class ArucoDetector(Node):
                 except Exception as e:
                     self.get_logger().warn(f'销毁旧订阅失败: {e}')
                 self.image_sub = self.create_subscription(
-                    Image, '/camera/image_raw', self.image_cb, self.sensor_qos)
+                    Image, self.image_topic, self.image_cb, self.sensor_qos)
                 self.caminfo_sub = self.create_subscription(
-                    CameraInfo, '/camera/camera_info',
+                    CameraInfo, self.caminfo_topic,
                     self.caminfo_cb, self.sensor_qos)
                 self.no_frame_rounds = 0
         else:
@@ -221,7 +228,7 @@ class ArucoDetector(Node):
         self.frame_count += 1
         if self.K is None:
             self.get_logger().warn(
-                "收到图像但相机内参未初始化（检查 /camera/camera_info 是否有数据）",
+                f"收到图像但相机内参未初始化（检查 {self.caminfo_topic} 是否有数据）",
                 throttle_duration_sec=3.0)
             return
         try:

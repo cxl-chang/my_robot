@@ -536,6 +536,138 @@
         </visual>
         <pose>0 0 0 0 -0 0</pose>
         <enable_wind>false</enable_wind>
+        <!-- ===== 顶面 ArUco 贴片（临时，用于腕部相机验证）=====
+             与 -x 面贴片同一套纯几何图案，整体做刚体旋转 (x,y,z)->(z,y,-x)，
+             使图案平面朝 +z（顶面 z=+0.025，衬底 +0.026、黑底 +0.028、模块 +0.030）。
+             腕相机从上方俯视 45° 时只能看到顶面，侧面的贴片是"侧对着"不可检测。 -->
+        <visual name='aruco_top_white'>
+          <pose>0.0000 0.0000 0.0260 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.0460 0.0460 0.0020</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+          </material>
+        </visual>
+        <visual name='aruco_top_bg'>
+          <pose>0.0000 0.0000 0.0280 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.0320 0.0320 0.0020</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 0 0 1</ambient>
+            <diffuse>0.1 0.1 0.1 1</diffuse>
+          </material>
+        </visual>
+        <visual name='aruco_top_w0'>
+          <pose>0.0080 0.0080 0.0300 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.0054 0.0054 0.0020</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
+        </visual>
+        <visual name='aruco_top_w1'>
+          <pose>0.0080 -0.0027 0.0300 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.0054 0.0054 0.0020</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
+        </visual>
+        <visual name='aruco_top_w2'>
+          <pose>0.0080 -0.0080 0.0300 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.0054 0.0054 0.0020</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
+        </visual>
+        <visual name='aruco_top_w3'>
+          <pose>0.0027 0.0027 0.0300 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.0054 0.0054 0.0020</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
+        </visual>
+        <visual name='aruco_top_w4'>
+          <pose>0.0027 -0.0080 0.0300 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.0054 0.0054 0.0020</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
+        </visual>
+        <visual name='aruco_top_w5'>
+          <pose>-0.0027 -0.0027 0.0300 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.0054 0.0054 0.0020</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
+        </visual>
+        <visual name='aruco_top_w6'>
+          <pose>-0.0027 -0.0080 0.0300 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.0054 0.0054 0.0020</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
+        </visual>
+        <visual name='aruco_top_w7'>
+          <pose>-0.0080 -0.0027 0.0300 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.0054 0.0054 0.0020</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>1 1 1 1</emissive>
+          </material>
+        </visual>
       </link>
       <self_collide>false</self_collide>
     </model>
