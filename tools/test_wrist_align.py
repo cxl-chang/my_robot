@@ -40,13 +40,13 @@ def make_self(**kw):
     s.grasp_correct_count = 0
     s.stage = 'PICK_ALIGN'
     s.creep_dist = 0.0
-    s.base_bias = (0.0, 0.0)
+    s.pos_fix = (0.0, 0.0)
     s.wrist_fail = ''
     s._, s._now = None, lambda: None
-    # 信念（底盘视觉+定位）默认偏 -46mm，正是实测那一轮的情形
-    s.belief = (0.427, 0.049)
-    s._object_in_base = (lambda self: (self.belief[0] + self.base_bias[0],
-                                       self.belief[1] + self.base_bias[1],
+    # 底盘相机+定位的估算位置默认偏 -46mm，正是实测那一轮的情形
+    s.est = (0.427, 0.049)
+    s._object_in_base = (lambda self: (self.est[0] + self.pos_fix[0],
+                                       self.est[1] + self.pos_fix[1],
                                        0.43)).__get__(s)
     s.attach_gate = True
     s.attach_enabled = True
@@ -85,17 +85,17 @@ show('对齐 偏出窗口→蠕动', s)
 assert abs(s.creep_dist - (0.470 - 0.435)) < 1e-9, s.creep_dist
 assert s.grasp_correct_count == 1
 
-# 3) 对齐：测到的点离原目标 90mm < 150mm → 采纳（信念可能比测量更差）
+# 3) 对齐：测到的点离原目标 90mm < 150mm → 采纳（估算值可能比测量更差）
 s = make_self()
 assert T._apply_wrist_align(s, (0.4495, 0.0, 0.505)) == 'grasp'
 show('对齐 偏20mm 采纳', s)
 assert abs(s.pick_tool_x - 0.4495) < 1e-9, s.pick_tool_x
 assert s.wrist_offset is not None and math.hypot(*s.wrist_offset) < 1e-9
-# 信念被校正为 实测−信念 = 0.4505−0.427
-assert abs(s.base_bias[0] - (0.4495 - 0.427)) < 1e-9, s.base_bias
+# 位置修正量 = 实测 − 估算 = 0.4495 − 0.427
+assert abs(s.pos_fix[0] - (0.4495 - 0.427)) < 1e-9, s.pos_fix
 # 第二轮再测：偏差不叠加（同一实测值 → bias 不变）
 assert T._apply_wrist_align(s, (0.4495, 0.0, 0.505)) == 'grasp'
-assert abs(s.base_bias[0] - (0.4495 - 0.427)) < 1e-9, s.base_bias
+assert abs(s.pos_fix[0] - (0.4495 - 0.427)) < 1e-9, s.pos_fix
 
 # 3b) 对齐：测到的点离原目标 200mm > 150mm → 疑似认错物体，保持原目标
 s = make_self()

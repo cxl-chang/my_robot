@@ -178,10 +178,10 @@ class TaskOrchestrator(Node):
         # 竖直方向的 TF 明显滞后（横向不受影响，见 _apply_wrist_align 的说明）
         self.declare_parameter('wrist_settle', 0.5)
         # 腕相机测到的方块中心与当前工具目标差超过它就不信这次测量。
-        # 0.15 而不是 0.06：实测这一轮底盘视觉/定位的信念就偏了 45mm
-        # （日志"真值 (0.473,0.047)，差 (-45,+3)mm"），而腕相机在同一时刻
-        # 测出的正是 (0.473,0.047) —— 测量是准的，是**信念**错了。
-        # 所以这个门只用来挡"认错物体/测飞了"这种粗差，不能拿它跟信念比精度。
+        # 0.15 而不是 0.06：实测那一轮"底盘相机 + 定位"把方块位置估偏了 45mm
+        # （估算 (0.427,0.051) vs 真值 (0.473,0.047)），而同一时刻腕相机测出的
+        # 正是 (0.473,0.047) —— 腕相机准，是**底盘那条链**不准。
+        # 所以这个门只用来挡"认错物体/测飞了"这种粗差，不能拿它去跟估算值比精度。
         self.declare_parameter('wrist_align_max', 0.15)
         # 复核容差：方块中心与工具实际 xy 的残差超过它就**不吸附**（判抓取失败）
         # 0.02 = 方块半个 0.025 再留 5mm，此时方块完全落在两指之间
@@ -534,9 +534,10 @@ class TaskOrchestrator(Node):
         self.wrist_offset = None     # 对齐后仍存在的残差 (dx,dy)，供吸附门控用
         self.wrist_last = None       # 最近一次腕相机中值 base 系 (x,y,z)
         self.wrist_fail = ''         # 对齐阶段判失败时的原因字符串
-        # 腕相机实测 − 信念（底盘视觉/AMCL）的横向差；每轮抓取清零。
-        # 蠕动微调与可达性判断都闭在信念上，不知道这个偏差就会停在错的位置。
-        self.base_bias = (0.0, 0.0)
+        # 位置修正量 = 腕相机实测位置 − 底盘相机/定位估算的位置（每轮抓取清零）。
+        # 蠕动微调、可达性判断都是按"估算位置"闭环的，不把这个差补上，
+        # 就会停在偏了 3~5cm 的地方（实测就是这样）。
+        self.pos_fix = (0.0, 0.0)
         self.cube_in_scene = False   # 方块是否已在碰撞世界里（避免无用 REMOVE）
         self._truth_logged = False
         if self.scene_enable and self.scene_cube_source == 'truth':
@@ -831,10 +832,10 @@ class TaskOrchestrator(Node):
     def _object_in_base(self):
         """方块在当前机器人 base 系下的位置 (x, y, 距离)；拿不到位姿返回 None。
 
-        `base_bias` 是**腕相机实测 − 本函数算出的信念**（见 _apply_wrist_align）。
-        底盘相机/AMCL 的信念实测会偏 4~5cm（日志"真值 (0.473,0.047)，差
-        (-45,+3)mm"），而蠕动微调、可达性判断都闭在这个信念上，必然停在错的
-        位置。腕相机量到的偏差一旦有了，就加回来当修正，且每轮抓取清零。
+        `pos_fix` 是腕相机实测位置与本函数估算位置之差（见 _apply_wrist_align）。
+        底盘相机 + AMCL 这条链实测会偏 3~5cm（估算 (0.427,0.051) vs 真值
+        (0.473,0.047)），而蠕动微调、可达性判断都是按这个估算值闭环的，
+        不加修正就会停在偏了 3~5cm 的地方。每轮抓取清零。
         """
         pose = self._map_pose()
         if pose is None:
@@ -843,8 +844,8 @@ class TaskOrchestrator(Node):
         ox, oy = self._obj_xy()
         dx, dy = ox - rx, oy - ry
         c, s = math.cos(-ryaw), math.sin(-ryaw)
-        bx = c * dx - s * dy + self.base_bias[0]
-        by = s * dx + c * dy + self.base_bias[1]
+        bx = c * dx - s * dy + self.pos_fix[0]
+        by = s * dx + c * dy + self.pos_fix[1]
         return bx, by, math.hypot(bx, by)
 
     def _nav_to_place(self):
@@ -1164,19 +1165,22 @@ class TaskOrchestrator(Node):
                 f'疑似认错物体 → 保持原目标')
             return 'grasp'
 
-        # 用这次实测校准"信念"，让蠕动微调闭在真实位置上（不信则不加）
-        bel = self._object_in_base()
-        if bel is not None:
-            # _object_in_base 已经加了旧 bias ⇒ 先扣掉，得到"原始信念"，再算新偏差
-            # （否则蠕动再来一轮时会把偏差算成残差，越修越偏）
-            rawx = bel[0] - self.base_bias[0]
-            rawy = bel[1] - self.base_bias[1]
-            self.base_bias = (bx - rawx, by - rawy)
-            if math.hypot(*self.base_bias) > 0.02:
+        # 用这次实测，把"底盘相机/定位把方块估偏了多少"记下来，
+        # 好让蠕动微调闭在真实位置上（实测不可信时会提前 return，不会走到这里）
+        est = self._object_in_base()
+        if est is not None:
+            # _object_in_base 已经加了旧的 pos_fix ⇒ 先扣掉才是底盘原始估算值
+            # （否则蠕动再来一轮时会把修正量当成残差，越修越偏）
+            estx = est[0] - self.pos_fix[0]
+            esty = est[1] - self.pos_fix[1]
+            self.pos_fix = (bx - estx, by - esty)
+            if math.hypot(*self.pos_fix) > 0.02:
                 self.get_logger().warn(
-                    f'信念偏差已校正：底盘视觉/定位的方块位置比实测偏 '
-                    f'({self.base_bias[0] * 1000:+.0f},{self.base_bias[1] * 1000:+.0f})mm'
-                    f'（蠕动微调与可达性判断都将按实测修正后的位置算）')
+                    f'位置修正量 ({self.pos_fix[0] * 1000:+.0f},'
+                    f'{self.pos_fix[1] * 1000:+.0f})mm：底盘相机 + 定位把方块'
+                    f'估偏了这么多（估算 ({estx:.3f},{esty:.3f}) vs 实测 '
+                    f'({bx:.3f},{by:.3f})）；腕相机更准，后面的蠕动微调'
+                    f'和可达性判断都按修正后的位置算')
 
         # 方块偏在"竖直下抓安全窗口"之外 ⇒ 不能凑合夹边上，先蠕动摇过去。
         # 此刻手臂还在 pregrasp（方块上方 15cm），底盘动是安全的。
@@ -1278,7 +1282,7 @@ class TaskOrchestrator(Node):
         self.wrist_samples = None
         self.wrist_phase = None
         self.wrist_deadline = None
-        self.base_bias = (0.0, 0.0)
+        self.pos_fix = (0.0, 0.0)
         if not self.enable_pick:
             # 调试模式：跳过机械臂，直接当"已抓起"（等价于 M9 的占位行为）
             self.get_logger().warn('enable_pick=false，跳过抓取，直接去放置点')
