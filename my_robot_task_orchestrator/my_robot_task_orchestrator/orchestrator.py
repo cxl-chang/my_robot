@@ -161,6 +161,26 @@ class TaskOrchestrator(Node):
         self.declare_parameter('vision_tf_timeout', 0.2)   # TF 等待上限 s
         # 视觉位置与参数位置差超过这个值就认为测歪了，退回参数
         self.declare_parameter('vision_max_dev', 1.0)
+        # --- 腕相机相对对齐（抓取精度的最后一道） ---
+        # 底盘相机离方块 ~0.6m，PnP 残差 + 定位误差合起来约 1~2cm；而夹爪张开
+        # 内壁在 ±0.06、方块半个 0.025，横向余量只有 ±0.035m。残差接近上限时
+        # 就会出现"一根手指压到方块顶面"或"夹在棱上（夹偏）"；而
+        # /red_cube/attach 是无条件发的，于是顶上去也报"已抓取"（假抓取）。
+        # 腕相机距方块只有 0.1~0.2m：pregrasp 测一次做**相对对齐**，降到抓取
+        # 高度再测一次做**复核**，超差就不吸附、交给 M15 重试。
+        self.declare_parameter('wrist_enable', True)
+        self.declare_parameter('wrist_det_topic', '/object_detection_wrist')
+        self.declare_parameter('wrist_enable_topic', '/wrist_detection_enable')
+        self.declare_parameter('wrist_class', 'red_cube')
+        self.declare_parameter('wrist_collect_n', 3)        # 攒几帧取中值
+        self.declare_parameter('wrist_collect_time', 0.5)   # 最多等多久 s
+        # 腕相机测到的方块中心与当前工具目标差超过它就不信这次测量
+        # （正常是厘米级；大了说明测歪/认错，保持原目标继续抓）
+        self.declare_parameter('wrist_align_max', 0.06)
+        # 复核容差：方块中心与工具实际 xy 的残差超过它就**不吸附**（判抓取失败）
+        # 0.02 = 方块半个 0.025 再留 5mm，此时方块完全落在两指之间
+        self.declare_parameter('wrist_verify_tol', 0.02)
+        self.declare_parameter('attach_gate', True)         # 复核不过就不吸附
         self.declare_parameter('grasp_tol', 0.03)          # 偏差≤此值用名义目标
         # 偏差在 (grasp_tol, grasp_compensate_xy] 内时**直接改用实测位置**当 IK 目标。
         # 取 0.30 而不是 0.08：到位姿态漂移十几度就能让横向坐标差 0.15~0.20 m，
@@ -392,6 +412,15 @@ class TaskOrchestrator(Node):
         self.vision_frame = g('vision_frame').value
         self.vision_tf_timeout = g('vision_tf_timeout').value
         self.vision_max_dev = g('vision_max_dev').value
+        self.wrist_enable = bool(g('wrist_enable').value)
+        self.wrist_det_topic = g('wrist_det_topic').value
+        self.wrist_enable_topic = g('wrist_enable_topic').value
+        self.wrist_class = g('wrist_class').value
+        self.wrist_collect_n = int(g('wrist_collect_n').value)
+        self.wrist_collect_time = g('wrist_collect_time').value
+        self.wrist_align_max = g('wrist_align_max').value
+        self.wrist_verify_tol = g('wrist_verify_tol').value
+        self.attach_gate = bool(g('attach_gate').value)
         self.scene_world_file = g('scene_world_file').value
         self.scene_models = g('scene_models').value
         self.scene_acm_enable = bool(g('scene_acm_enable').value)
@@ -444,6 +473,10 @@ class TaskOrchestrator(Node):
             NavStatus, '/nav_status', self.nav_status_cb, 10)
         self.det_sub = self.create_subscription(
             ObjectDetection, '/object_detection', self.det_cb, 10)
+        # 腕相机识别（同一套 ObjectDetection 契约，只是换了相机）：抓取前做
+        # 相对对齐，抓取高度上做复核。话题名可配，默认 /object_detection_wrist
+        self.wrist_det_sub = self.create_subscription(
+            ObjectDetection, self.wrist_det_topic, self.wrist_det_cb, 10)
         # 机器人实际位姿（AMCL）：抓取前用它把"方块世界坐标"换算到 base 系，
         # 判断机械臂到底够不够得到（详见 _check_grasp_reachable）
         self.amcl_sub = self.create_subscription(
@@ -465,6 +498,9 @@ class TaskOrchestrator(Node):
         self.detect_enable_pub = self.create_publisher(
             Bool, self.get_parameter('detect_enable_topic').value,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.wrist_enable_pub = self.create_publisher(
+            Bool, self.wrist_enable_topic,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.attach_pub = self.create_publisher(Empty, self.attach_topic, 10)
         self.detach_pub = self.create_publisher(Empty, self.detach_topic, 10)
         self.arm_client = ActionClient(self, ArmTask, '/arm_task')
@@ -484,6 +520,12 @@ class TaskOrchestrator(Node):
         self.det_samples = None      # 识别阶段攒样本 [(map_xy, base_xyz)]
         self.det_frame = ''
         self.det_collect_deadline = None
+        # 腕相机对齐/复核：样本为 base 系 (x,y,z)，phase 标记当前是哪个阶段
+        self.wrist_samples = None
+        self.wrist_phase = None      # 'align' | 'verify'
+        self.wrist_deadline = None
+        self.wrist_offset = None     # 对齐后仍存在的残差 (dx,dy)，供吸附门控用
+        self.wrist_last = None       # 最近一次腕相机中值 base 系 (x,y,z)
         self.cube_in_scene = False   # 方块是否已在碰撞世界里（避免无用 REMOVE）
         self._truth_logged = False
         if self.scene_enable and self.scene_cube_source == 'truth':
@@ -554,6 +596,12 @@ class TaskOrchestrator(Node):
         self.detect_enable_pub.publish(Bool(data=bool(on)))
         self.get_logger().info(
             f'物体识别{"开启" if on else "暂停"}' + (f'（{why}）' if why else ''))
+
+    def _set_wrist_detect(self, on, why=''):
+        """开关**腕相机**识别（独立话题，别和底盘相机的混用）"""
+        self.wrist_enable_pub.publish(Bool(data=bool(on)))
+        self.get_logger().info(
+            f'腕相机识别{"开启" if on else "暂停"}' + (f'（{why}）' if why else ''))
 
     def _now(self):
         return self.get_clock().now()
@@ -991,8 +1039,156 @@ class TaskOrchestrator(Node):
                 f'{(math.degrees(belief[2] - self.truth_robot[2])):+.1f}°')
         self.vision_logged = True
 
+    # ========== 腕相机：抓取前的相对对齐与抓取高度的复核 ==========
+    def wrist_det_cb(self, msg: ObjectDetection):
+        if self.wrist_phase is None:
+            return
+        if msg.class_id != self.wrist_class:
+            return
+        pb = self._transform_point(msg.pose, 'base_link')
+        if pb is None:
+            return
+        if self.wrist_samples is None:
+            self.wrist_samples = []
+        self.wrist_samples.append(pb)
+        self.get_logger().info(
+            f'腕相机 {self.wrist_phase} 第 {len(self.wrist_samples)} 帧：'
+            f'方块在 base 系 ({pb[0]:.3f},{pb[1]:.3f},{pb[2]:.3f})')
+        if (len(self.wrist_samples) >= self.wrist_collect_n
+                or (self.wrist_deadline is not None
+                    and self._now() >= self.wrist_deadline)):
+            self._finish_wrist()
+
+    def _start_wrist(self, phase):
+        """进入一个腕相机测量子阶段。返回 False 表示不测（直接往下走）。"""
+        if not self.wrist_enable:
+            return False
+        self.wrist_phase = phase
+        self.wrist_samples = []
+        self.wrist_offset = None      # 重新测量前先清掉上一次的残差（门控只看本轮）
+        self.wrist_deadline = self._now() + rclpy.duration.Duration(
+            seconds=self.wrist_collect_time)
+        self.stage = 'PICK_ALIGN' if phase == 'align' else 'PICK_VERIFY'
+        self._set_wrist_detect(
+            True, '对齐中' if phase == 'align' else '复核抓取高度')
+        return True
+
+    def _start_wrist_align(self):
+        """pregrasp（夹爪已张开）→ 用腕相机把工具目标对到方块中心。"""
+        if not self._start_wrist('align'):
+            self._begin_grasp()
+            return
+        self.get_logger().info(
+            f'[腕相机对齐] 当前工具目标 ({self.pick_tool_x:.3f},'
+            f'{self.pick_tool_y:.3f})，开始测量方块中心')
+
+    def _finish_wrist(self):
+        phase, self.wrist_phase = self.wrist_phase, None
+        samples, self.wrist_samples = self.wrist_samples, None
+        self.wrist_deadline = None
+        self._set_wrist_detect(False, '本次测量结束')
+        got = self._median_xyz(samples)
+        if phase == 'align':
+            self._apply_wrist_align(got)
+            self._begin_grasp()
+        else:
+            self._apply_wrist_verify(got)
+            self._begin_tail()
+
+    @staticmethod
+    def _median_xyz(samples):
+        if not samples:
+            return None
+        xs = sorted(s[0] for s in samples)
+        ys = sorted(s[1] for s in samples)
+        zs = sorted(s[2] for s in samples)
+        n = len(samples)
+        return (xs[n // 2], ys[n // 2], zs[n // 2])
+
+    def _apply_wrist_align(self, got):
+        """把工具目标横向校正到腕相机测到的方块中心（受安全窗口约束）。"""
+        if got is None:
+            self.wrist_offset = None
+            self.get_logger().warn(
+                f'腕相机没测到 {self.wrist_class}（{self.wrist_collect_time}s 内），'
+                f'按原目标 ({self.pick_tool_x:.3f},{self.pick_tool_y:.3f}) 抓取')
+            return
+        bx, by = got[0], got[1]
+        self.wrist_last = got
+        diff = math.hypot(bx - self.pick_tool_x, by - self.pick_tool_y)
+        if diff > self.wrist_align_max:
+            self.wrist_offset = None
+            self.get_logger().warn(
+                f'腕相机测到方块 ({bx:.3f},{by:.3f}) 与原目标 '
+                f'({self.pick_tool_x:.3f},{self.pick_tool_y:.3f}) 差 '
+                f'{diff * 1000:.0f}mm > {self.wrist_align_max * 1000:.0f}mm，'
+                f'不可信 → 保持原目标')
+            return
+        # 实测位置必须仍落在"竖直下抓安全窗口"内，否则只夹到边界（残差留给复核判）
+        tx = min(max(bx, self.grasp_x_min), self.grasp_reach_x_max)
+        ty = min(max(by, -self.grasp_reach_y), self.grasp_reach_y)
+        self.wrist_offset = (bx - tx, by - ty)
+        resid = math.hypot(*self.wrist_offset)
+        if resid > 1e-4:
+            self.get_logger().warn(
+                f'腕相机对齐：目标被安全窗口界幅 '
+                f'({self.pick_tool_x:.3f},{self.pick_tool_y:.3f})→'
+                f'({tx:.3f},{ty:.3f})，方块仍在窗口外 {resid * 1000:.0f}mm')
+        self.get_logger().info(
+            f'[腕相机对齐] 工具目标 ({self.pick_tool_x:.3f},{self.pick_tool_y:.3f})'
+            f' → ({tx:.3f},{ty:.3f})｜校正 '
+            f'({(tx - self.pick_tool_x) * 1000:+.0f},'
+            f'{(ty - self.pick_tool_y) * 1000:+.0f})mm｜'
+            f'方块中心 base 系 ({bx:.3f},{by:.3f},{got[2]:.3f})')
+        self.pick_tool_x, self.pick_tool_y = tx, ty
+
+    def _apply_wrist_verify(self, got):
+        """降到抓取高度后复核：方块是否真在两指之间。"""
+        if got is None:
+            self.get_logger().warn(
+                '腕相机复核没测到方块（可能已被夹爪挡住）→ 按对齐结果继续抓取')
+            return
+        bx, by = got[0], got[1]
+        self.wrist_last = got
+        dx, dy = bx - self.pick_tool_x, by - self.pick_tool_y
+        resid = math.hypot(dx, dy)
+        self.wrist_offset = (dx, dy)
+        if resid > self.wrist_verify_tol:
+            self.get_logger().warn(
+                f'[腕相机复核] 残差 {resid * 1000:.0f}mm > 容差 '
+                f'{self.wrist_verify_tol * 1000:.0f}mm'
+                f'（({dx * 1000:+.0f},{dy * 1000:+.0f})mm）→ 判抓取失败')
+        else:
+            self.get_logger().info(
+                f'[腕相机复核] 残差 {resid * 1000:.0f}mm ≤ '
+                f'{self.wrist_verify_tol * 1000:.0f}mm，方块居中 → 可以吸附')
+
+    def _wrist_gate_ok(self):
+        """吸附前门控：复核超差就不吸附（免得"顶上去也算抓到"）。"""
+        if not (self.attach_enable_gate()):
+            return True
+        if self.wrist_offset is None:
+            return True                    # 没测到就不拦（保证主流程能跑）
+        resid = math.hypot(*self.wrist_offset)
+        if resid <= self.wrist_verify_tol:
+            return True
+        self._fail(
+            f'腕相机复核残差 {resid * 1000:.0f}mm > '
+            f'{self.wrist_verify_tol * 1000:.0f}mm（夹爪没夹到方块中心，'
+            f'继续吸附会变成"顶在方块上"的假抓取）', 'pick')
+        return False
+
+    def attach_enable_gate(self):
+        return bool(self.attach_gate and self.attach_enabled)
+
     def _begin_pick(self):
         self.grasp_correct_count = 0        # 本轮抓取的"补进"计数清零
+        # 每轮抓取重新做腕相机对齐/复核（M15 重试也会走到这里）
+        self.wrist_offset = None
+        self.wrist_last = None
+        self.wrist_samples = None
+        self.wrist_phase = None
+        self.wrist_deadline = None
         if not self.enable_pick:
             # 调试模式：跳过机械臂，直接当"已抓起"（等价于 M9 的占位行为）
             self.get_logger().warn('enable_pick=false，跳过抓取，直接去放置点')
@@ -1155,9 +1351,9 @@ class TaskOrchestrator(Node):
                     self.pick_tool_x, self.pick_tool_y = bx, by
                     self.stage = 'PICK'
                     self.ops_category = 'pick'
-                    self._run_ops(self._pick_ops(),
-                                  TaskStatus.PICKED, '抓取完成，准备搬运',
-                                  then=self._nav_to_place)
+                    # 先到 pregrasp 张开夹爪 → 腕相机对齐 → 下压 → 复核 → 合拢
+                    self._run_ops(self._pick_ops_approach(), TaskStatus.GRASPING,
+                                  '已到预抓取位', then=self._start_wrist_align)
                     return 'done'
                 self.creep_start = self._now()
                 self.creep_settle_until = None
@@ -1180,15 +1376,31 @@ class TaskOrchestrator(Node):
 
         return 'ok'
 
-    def _pick_ops(self):
-        ops = [
+    def _pick_ops_approach(self):
+        """第一段：到 pregrasp 并张开夹爪，**然后停下来测腕相机**。"""
+        return [
             self._op_goal('预抓取',
                           self._goal_pose(self.pick_tool_x, self.pick_tool_y,
                                           self.pregrasp_z, False)),
             self._op_goal('张开夹爪', self._goal_named('gripper', 'gripper_open')),
+        ]
+
+    def _pick_ops_grasp(self):
+        """第二段：下压到抓取高度，**然后停下来复核**。"""
+        return [
             self._op_goal('下压抓取',
                           self._goal_pose(self.pick_tool_x, self.pick_tool_y,
                                           self.grasp_z, True)),
+        ]
+
+    def _pick_ops_tail(self):
+        """第三段：合拢、吸附、抬起、收起搬运。
+
+        注意：复核门控**不在这里**用 fn 动作做 —— fn 动作返回后 `_op_start` 会
+        继续往下发动作，`_fail` 也拦不住。门控做在 `_op_start` 的"合拢夹爪"
+        之前（和失败注入同一个位置），不通过就清空剩余序列。
+        """
+        ops = [
             self._op_goal('合拢夹爪',
                           self._goal_named('gripper', 'gripper_grasp')),
         ]
@@ -1210,6 +1422,29 @@ class TaskOrchestrator(Node):
             self._op_goal('收起搬运', self._goal_named('arm', 'carry')),
         ]
         return ops
+
+    def _pick_ops(self):
+        # 兼容旧调用：不再直接拼全序列（现在中间要插两个腕相机阶段）
+        return self._pick_ops_tail()
+
+    def _begin_grasp(self):
+        """对齐完成 → 下压。"""
+        self.stage = 'PICK'          # 必须切回 PICK，否则 timer 的腕相机分支会拦住序列驱动
+        self.ops_category = 'pick'
+        self._run_ops(self._pick_ops_grasp(), TaskStatus.GRASPING,
+                      '已降到抓取高度', then=self._start_wrist_verify)
+
+    def _begin_tail(self):
+        """复核完成 → 合拢/吸附/抬起/搬运。"""
+        self.stage = 'PICK'
+        self.ops_category = 'pick'
+        self._run_ops(self._pick_ops_tail(), TaskStatus.PICKED,
+                      '抓取完成，准备搬运', then=self._nav_to_place)
+
+    def _start_wrist_verify(self):
+        """降到抓取高度后复核方块是否还在两指之间。"""
+        if not self._start_wrist('verify'):
+            self._begin_tail()
 
     def _place_ops(self):
         ops = [
@@ -1272,6 +1507,13 @@ class TaskOrchestrator(Node):
                 return
             op = self.ops[self.op_idx]
             self._pub_status(None, op['label'])
+            # 吸附门控：腕相机复核超差 ⇒ 不合拢、不吸附，直接判失败（M15 会重试）。
+            # 必须放在这里而不是写成 fn 动作：fn 动作返回后序列还会继续往下发。
+            if (op['label'] == '合拢夹爪' and self.attach_enabled
+                    and self.attach_gate and not self._wrist_gate_ok()):
+                self.ops = None
+                self.op_kind = None
+                return
             # 测试钩子：抓取注入在"下压抓取"，放置注入在"下放"
             for cat, label in (('pick', '下压抓取'), ('place', '下放')):
                 if op['label'] == label and self._maybe_inject(cat, label):
@@ -1733,6 +1975,12 @@ class TaskOrchestrator(Node):
                     act()
             return
 
+        # --- 腕相机测量：到点就收尾（没有新帧也不能卡死）---
+        if self.stage in ('PICK_ALIGN', 'PICK_VERIFY'):
+            if self.wrist_deadline is not None and now >= self.wrist_deadline:
+                self._finish_wrist()
+            return
+
         # --- 手臂序列驱动 ---
         if self.ops is not None:
             if self.op_kind == 'RESEND' and now >= self.op_wait_until:
@@ -1810,9 +2058,8 @@ class TaskOrchestrator(Node):
                         return          # 偏差极小，已直接开始抓取序列
                     self.stage = 'PICK'
                     self.ops_category = 'pick'
-                    self._run_ops(self._pick_ops(),
-                                  TaskStatus.PICKED, '抓取完成，准备搬运',
-                                  then=self._nav_to_place)
+                    self._run_ops(self._pick_ops_approach(), TaskStatus.GRASPING,
+                                  '已到预抓取位', then=self._start_wrist_align)
                 elif nxt == 'PLACE':
                     self.stage = 'PLACE'
                     self.ops_category = 'place'
@@ -1894,6 +2141,12 @@ class TaskOrchestrator(Node):
     def _reset_detect(self):
         self.det_samples = None
         self.det_collect_deadline = None
+        # 腕相机的对齐/复核结果每轮抓取都要重测（上轮的残差不能拿来判这轮）
+        self.wrist_samples = None
+        self.wrist_phase = None
+        self.wrist_deadline = None
+        self.wrist_offset = None
+        self.wrist_last = None
         self.det_deadline = self._now() + rclpy.duration.Duration(
             seconds=self.detect_timeout)
 

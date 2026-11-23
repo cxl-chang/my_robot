@@ -85,8 +85,11 @@ def generate_launch_description():
     place_approach_z = LaunchConfiguration('place_approach_z')
     place_down_z = LaunchConfiguration('place_down_z')
     attach_enabled = LaunchConfiguration('attach_enabled')
+    wrist_enable = LaunchConfiguration('wrist_enable')
+    attach_gate = LaunchConfiguration('attach_gate')
     fail_inject = LaunchConfiguration('fail_inject')
     fail_inject_always = LaunchConfiguration('fail_inject_always')
+    wrist_detector = LaunchConfiguration('wrist_detector')
     retry_enable = LaunchConfiguration('retry_enable')
     pick_retries = LaunchConfiguration('pick_retries')
     place_retries = LaunchConfiguration('place_retries')
@@ -237,6 +240,13 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'attach_enabled', default_value='true',
             description='是否用 DetachableJoint 吸附（仿真抓取可靠性）'),
+        # --- 腕相机相对对齐（解决"夹爪顶在方块上/夹偏"）---
+        DeclareLaunchArgument(
+            'wrist_enable', default_value='true',
+            description='抓取前用腕相机做相对对齐、抓取高度做复核'),
+        DeclareLaunchArgument(
+            'attach_gate', default_value='true',
+            description='腕相机复核超差就不吸附（拦截"顶上去也算抓到"的假抓取）'),
         # --- MoveIt 碰撞世界（把方块/台子放进 planning scene）---
         # 逐级验证用：\n        #   ① 先只开 scene_tables，RViz 里应看到取件台；
         #   ② 再开 scene_cube，识别后应看到方块（日志打印真值/参数偏差）；
@@ -250,6 +260,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'fail_inject_always', default_value='false',
             description='注入失败时每次都触发（重试也失败，用来验证次数耗尽）'),
+        DeclareLaunchArgument(
+            'wrist_detector', default_value='true',
+            description='是否再起一个检测节点订阅腕部相机（/wrist_camera/*），'
+                        '结果发到 /object_detection_wrist'),
         DeclareLaunchArgument(
             'retry_enable', default_value='true',
             description='失败自动重试（M15）：按阶段分类，各自次数独立'),
@@ -367,9 +381,28 @@ def generate_launch_description():
         output='screen',
         parameters=[{'max_rate_hz': detect_rate}])
 
+    # 腕部相机检测器：同一份节点代码，只换话题（image_topic/caminfo_topic/det_topic）
+    # 识别开关用独立话题 /wrist_detection_enable —— 它只在"抓取前相对对齐"那一刻需要开，
+    # 平时关掉省 CPU。start_enabled=true 便于手动验证（先用 RViz + 话题确认能看到方块）。
+    wrist_aruco_node = Node(
+        package='my_robot_perception',
+        executable='aruco_detector',
+        name='wrist_aruco_detector',
+        output='screen',
+        parameters=[{
+            'max_rate_hz': 10.0,
+            'image_topic': '/wrist_camera/image_raw',
+            'caminfo_topic': '/wrist_camera/camera_info',
+            'det_topic': '/object_detection_wrist',
+            'enable_topic': '/wrist_detection_enable',
+            'start_enabled': True,
+        }],
+        condition=IfCondition(wrist_detector))
+
     nav_group = TimerAction(
         period=nav_delay,
-        actions=[amcl_launch, slam_launch, nav_commander_node, aruco_node])
+        actions=[amcl_launch, slam_launch, nav_commander_node,
+                 aruco_node, wrist_aruco_node])
 
     # ================= 3) 机械臂执行入口（t=arm_delay） =================
     # 订阅 /pose_cmd、/joint_cmd、/gripper_cmd（话题）与 /arm_task（action），
@@ -417,6 +450,8 @@ def generate_launch_description():
             'place_via': place_via,
             'place_via_dist': place_via_dist,
             'attach_enabled': attach_enabled,
+            'wrist_enable': wrist_enable,
+            'attach_gate': attach_gate,
             'fail_inject': fail_inject,
             'fail_inject_always': fail_inject_always,
             'retry_enable': retry_enable,
