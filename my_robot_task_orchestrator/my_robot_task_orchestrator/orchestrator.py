@@ -534,6 +534,10 @@ class TaskOrchestrator(Node):
         self.wrist_offset = None     # 对齐后仍存在的残差 (dx,dy)，供吸附门控用
         self.wrist_last = None       # 最近一次腕相机中值 base 系 (x,y,z)
         self.wrist_fail = ''         # 对齐阶段判失败时的原因字符串
+        # 测量时夹爪绕 base z 的朝向：腕相机刚性装在夹爪上，joint6 一转相机就
+        # 甩到另一侧（任务构型 joint6≈-π，从上电构型过去要转约 170°）。
+        self.wrist_yaw = None        # 本次测量的工具朝向 rad
+        self.align_yaw = None        # 对齐那次测量的朝向，用来跟复核比对
         # 位置修正量 = 腕相机实测位置 − 底盘相机/定位估算的位置（每轮抓取清零）。
         # 蠕动微调、可达性判断都是按"估算位置"闭环的，不把这个差补上，
         # 就会停在偏了 3~5cm 的地方（实测就是这样）。
@@ -1077,6 +1081,21 @@ class TaskOrchestrator(Node):
                     and self._now() >= self.wrist_deadline)):
             self._finish_wrist()
 
+    def _tool_yaw_now(self):
+        """夹爪当前绕 base z 的朝向（rad）；查不到返回 None。
+
+        腕相机装在夹爪上 7.5cm 偏置处：joint6 一变，相机就换到夹爪的另一侧。
+        对齐与复核必须在**同一个朝向**下测量，否则两边的视野/偏置方向不一致。
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                'base_link', 'gripper_base_link', rclpy.time.Time())
+        except Exception:      # noqa: BLE001
+            return None
+        q = tf.transform.rotation
+        return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                          1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
     def _start_wrist(self, phase):
         """进入一个腕相机测量子阶段。返回 False 表示不测（直接往下走）。"""
         if not self.wrist_enable:
@@ -1110,6 +1129,24 @@ class TaskOrchestrator(Node):
         samples, self.wrist_samples = self.wrist_samples, None
         self.wrist_deadline = None
         self._set_wrist_detect(False, '本次测量结束')
+        self.wrist_yaw = self._tool_yaw_now()
+        if self.wrist_yaw is not None:
+            self.get_logger().info(
+                f'腕相机测量时夹爪朝向 yaw={math.degrees(self.wrist_yaw):+.0f}°'
+                f'（相机在这一侧；任务构型 joint6≈-180°，从上电构型过来会转 ~170°）')
+        if phase == 'align':
+            self.align_yaw = self.wrist_yaw
+        elif (self.align_yaw is not None and self.wrist_yaw is not None):
+            dyaw = self.wrist_yaw - self.align_yaw
+            dyaw = (dyaw + math.pi) % (2 * math.pi) - math.pi
+            if abs(math.degrees(dyaw)) > 30.0:
+                self.get_logger().warn(
+                    f'抓取姿态比对齐时转了 {math.degrees(dyaw):+.0f}°'
+                    f'（腕关节翻到另一侧）→ 对齐结果与当前夹持方向不一致，'
+                    f'本次判抓取失败，避免夹歪')
+                self.wrist_fail = (
+                    f'夹爪在抓取高度转到了另一侧（{math.degrees(dyaw):+.0f}°），'
+                    f'腕相机是在另一侧对齐的，夹持方向已经不一致')
         got = self._median_xyz(samples)
         if phase == 'align':
             verdict = self._apply_wrist_align(got)
@@ -1119,6 +1156,9 @@ class TaskOrchestrator(Node):
                 self._fail(f'腕相机对齐失败：{self.wrist_fail}', 'pick')
             # 'creep'：已进入 PICK_CREEP，走完会回到 SETTLE → 重新抓取
         else:
+            if self.wrist_fail:
+                self._fail(self.wrist_fail, 'pick')
+                return
             self._apply_wrist_verify(got)
             self._begin_tail()
 
