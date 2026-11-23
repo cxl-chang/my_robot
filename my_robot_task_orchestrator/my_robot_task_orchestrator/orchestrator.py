@@ -1082,7 +1082,12 @@ class TaskOrchestrator(Node):
             return False
         self.wrist_phase = phase
         self.wrist_samples = []
-        self.wrist_offset = None      # 重新测量前先清掉上一次的残差（门控只看本轮）
+        if phase == 'align':
+            # 只有新一轮对齐才清残差。verify 阶段**不能**清：万一复核没测到
+            # 数据（方块被夹爪挡住/出画面），门控仍要拿 align 的残差判是否吸附。
+            # 实测事故：align 界幅留下 22mm 残差，verify 清了它 ⇒ 门控放行 ⇒
+            # 只有一根手指推着方块，吸附照样"成功"。
+            self.wrist_offset = None
         self.wrist_deadline = self._now() + rclpy.duration.Duration(
             seconds=self.wrist_collect_time)
         self.stage = 'PICK_ALIGN' if phase == 'align' else 'PICK_VERIFY'
@@ -1224,8 +1229,11 @@ class TaskOrchestrator(Node):
     def _apply_wrist_verify(self, got):
         """降到抓取高度后复核：方块是否真在两指之间。"""
         if got is None:
+            keep = ('（沿用对齐阶段残差 %.0fmm 作为门控依据）'
+                    % (math.hypot(*self.wrist_offset) * 1000)
+                    if self.wrist_offset is not None else '（无任何残差数据）')
             self.get_logger().warn(
-                '腕相机复核没测到方块（可能已被夹爪挡住）→ 按对齐结果继续抓取')
+                f'腕相机复核没测到方块（可能已被夹爪挡住）{keep}')
             return
         bx, by = got[0], got[1]
         self.wrist_last = got
@@ -1252,9 +1260,11 @@ class TaskOrchestrator(Node):
         if resid <= self.wrist_verify_tol:
             return True
         self._fail(
-            f'腕相机复核残差 {resid * 1000:.0f}mm > '
-            f'{self.wrist_verify_tol * 1000:.0f}mm（夹爪没夹到方块中心，'
-            f'继续吸附会变成"顶在方块上"的假抓取）', 'pick')
+            f'腕相机残差 {resid * 1000:.0f}mm > '
+            f'{self.wrist_verify_tol * 1000:.0f}mm（误差 '
+            f'({self.wrist_offset[0] * 1000:+.0f},'
+            f'{self.wrist_offset[1] * 1000:+.0f})mm，夹爪没夹到方块中心，'
+            f'继续吸附会变成"顶在方块上/只推着一根手指"的假抓取）', 'pick')
         return False
 
     def attach_enable_gate(self):

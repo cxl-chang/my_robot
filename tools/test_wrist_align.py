@@ -123,6 +123,15 @@ T._apply_wrist_verify(s, (0.438, 0.006, 0.505))
 show('复核 通过', s)
 assert T._wrist_gate_ok(s) is True and s.failed is None
 
+# 5b) 对齐已界幅留下 22mm 残差、复核又没测到 → 仍然要拦（本轮实测漏过去的洞）
+s = make_self()
+s.wrist_offset = (0.022, 0.0)
+T._apply_wrist_verify(s, None)
+show('对齐残差22mm+复核无数据', s)
+assert T._wrist_gate_ok(s) is False, '复核无数据时不能把对齐残差抹掉'
+assert s.failed is not None and s.failed[1] == 'pick'
+print('  失败原因:', s.failed[0])
+
 # 6) 复核：残差 33mm > 20mm → 不吸附、判 pick 失败（就是"顶在方块上"那种）
 s = make_self()
 T._apply_wrist_verify(s, (0.430, 0.033, 0.505))
